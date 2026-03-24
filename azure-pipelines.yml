@@ -1,38 +1,110 @@
 trigger:
   branches:
     include:
+      - production
       - main
       - develop
 
 pr:
   branches:
     include:
+      - production
       - main
       - develop
 
 variables:
   pythonVersion: "3.12"
-  dockerRegistryServiceConnection: "YOUR_ACR_SERVICE_CONNECTION"
-  azureSubscriptionServiceConnection: "YOUR_AZURE_SUBSCRIPTION_SERVICE_CONNECTION"
-  acrLoginServer: "yourregistry.azurecr.io"
+  azureSubscriptionServiceConnection: "prod-pneumorpheus-server"
+  azureLocation: "northeurope"
+  createInfrastructure: "true"
 
-  keyVaultName: ""
-  webAppResourceGroup: ""
-  keyVaultInferenceApiKeySecretName: ""
+  acrName: "pneumorpheusacr"
+  appServicePlanName: "pneumorpheus-plan"
+  keyVaultName: "PneumOrpheus"
+  webAppResourceGroup: "AI-Diagnostics"
+  keyVaultInferenceApiKeySecretName: "MODEL-INFERENCE-API-KEY"
 
   inferenceImageRepository: "pneumorpheus-inference-server"
-  webAppName: ""
+  webAppName: "PneumOrpheus-Server"
 
   modelSource: "azure_blob"
   modelLocalDir: "/models"
-  azureBlobContainer: ""
+  azureStorageAccountUrl: "https://pneumorphstore.blob.core.windows.net"
+  azureBlobContainer: "models"
   azureBlobPrefix: "models"
 
   tag: "$(Build.SourceBranchName)-$(Build.BuildId)"
 
 stages:
+  - stage: Provision
+    displayName: "Provision Infrastructure (optional)"
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: Bootstrap
+        displayName: "Create Azure resources if missing"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: AzureCLI@2
+            displayName: "Provision resource group, ACR, plan, web app"
+            condition: and(succeeded(), eq(variables['createInfrastructure'], 'true'))
+            inputs:
+              azureSubscription: "$(azureSubscriptionServiceConnection)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                set -euo pipefail
+
+                if [[ -z "$(webAppResourceGroup)" || -z "$(webAppName)" || -z "$(acrName)" || -z "$(appServicePlanName)" ]]; then
+                  echo "webAppResourceGroup, webAppName, acrName and appServicePlanName are required for createInfrastructure=true."
+                  exit 1
+                fi
+
+                az group create \
+                  --name "$(webAppResourceGroup)" \
+                  --location "$(azureLocation)" \
+                  --output none
+
+                if ! az acr show --name "$(acrName)" --resource-group "$(webAppResourceGroup)" >/dev/null 2>&1; then
+                  az acr create \
+                    --name "$(acrName)" \
+                    --resource-group "$(webAppResourceGroup)" \
+                    --sku Basic \
+                    --admin-enabled false \
+                    --output none
+                fi
+
+                if ! az appservice plan show --name "$(appServicePlanName)" --resource-group "$(webAppResourceGroup)" >/dev/null 2>&1; then
+                  az appservice plan create \
+                    --name "$(appServicePlanName)" \
+                    --resource-group "$(webAppResourceGroup)" \
+                    --sku B1 \
+                    --is-linux \
+                    --output none
+                fi
+
+                if ! az webapp show --name "$(webAppName)" --resource-group "$(webAppResourceGroup)" >/dev/null 2>&1; then
+                  az webapp create \
+                    --name "$(webAppName)" \
+                    --resource-group "$(webAppResourceGroup)" \
+                    --plan "$(appServicePlanName)" \
+                    --deployment-container-image-name "mcr.microsoft.com/azuredocs/aci-helloworld" \
+                    --output none
+                fi
+
+                if [[ -n "$(keyVaultName)" ]] && ! az keyvault show --name "$(keyVaultName)" --resource-group "$(webAppResourceGroup)" >/dev/null 2>&1; then
+                  az keyvault create \
+                    --name "$(keyVaultName)" \
+                    --resource-group "$(webAppResourceGroup)" \
+                    --location "$(azureLocation)" \
+                    --enable-rbac-authorization true \
+                    --output none
+                fi
+
   - stage: Validate
     displayName: "Validate"
+    dependsOn: Provision
+    condition: succeeded()
     jobs:
       - job: PythonChecks
         displayName: "Python compile check"
@@ -64,17 +136,26 @@ stages:
         steps:
           - checkout: self
 
-          - task: Docker@2
-            displayName: "Build and push inference image"
+          - task: AzureCLI@2
+            displayName: "Build and push image in ACR"
             inputs:
-              command: buildAndPush
-              repository: "$(inferenceImageRepository)"
-              dockerfile: "$(Build.SourcesDirectory)/Dockerfile"
-              buildContext: "$(Build.SourcesDirectory)"
-              containerRegistry: "$(dockerRegistryServiceConnection)"
-              tags: |
-                $(tag)
-                latest
+              azureSubscription: "$(azureSubscriptionServiceConnection)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                set -euo pipefail
+
+                if [[ -z "$(acrName)" ]]; then
+                  echo "acrName is required."
+                  exit 1
+                fi
+
+                az acr build \
+                  --registry "$(acrName)" \
+                  --image "$(inferenceImageRepository):$(tag)" \
+                  --image "$(inferenceImageRepository):latest" \
+                  --file "$(Build.SourcesDirectory)/Dockerfile" \
+                  "$(Build.SourcesDirectory)"
 
   - stage: Deploy
     displayName: "Deploy (optional)"
@@ -100,9 +181,26 @@ stages:
                   exit 1
                 fi
 
+                if [[ -z "$(acrName)" ]]; then
+                  echo "acrName is required when webAppName is set."
+                  exit 1
+                fi
+
                 if [[ -n "$(keyVaultInferenceApiKeySecretName)" && -z "$(keyVaultName)" ]]; then
                   echo "keyVaultName is required when keyVaultInferenceApiKeySecretName is set."
                   exit 1
+                fi
+
+                if [[ "$(modelSource)" == "azure_blob" ]]; then
+                  if [[ -z "$(azureStorageAccountUrl)" ]]; then
+                    echo "azureStorageAccountUrl is required when modelSource=azure_blob."
+                    exit 1
+                  fi
+
+                  if [[ -z "$(azureBlobContainer)" ]]; then
+                    echo "azureBlobContainer is required when modelSource=azure_blob."
+                    exit 1
+                  fi
                 fi
 
                 if [[ -n "$(keyVaultInferenceApiKeySecretName)" ]]; then
@@ -112,16 +210,8 @@ stages:
                     --query id -o tsv >/dev/null
                 fi
 
-          - task: AzureWebAppContainer@1
-            displayName: "Deploy inference container"
-            condition: and(succeeded(), ne(variables['webAppName'], ''))
-            inputs:
-              azureSubscription: "$(azureSubscriptionServiceConnection)"
-              appName: "$(webAppName)"
-              containers: "$(acrLoginServer)/$(inferenceImageRepository):$(tag)"
-
           - task: AzureCLI@2
-            displayName: "Configure inference app settings"
+            displayName: "Deploy and configure inference server"
             condition: and(succeeded(), ne(variables['webAppName'], ''), ne(variables['webAppResourceGroup'], ''))
             inputs:
               azureSubscription: "$(azureSubscriptionServiceConnection)"
@@ -129,6 +219,94 @@ stages:
               scriptLocation: "inlineScript"
               inlineScript: |
                 set -euo pipefail
+
+                acr_login_server="$(acrName).azurecr.io"
+                image_name="${acr_login_server}/$(inferenceImageRepository):$(tag)"
+
+                az webapp identity assign \
+                  --resource-group "$(webAppResourceGroup)" \
+                  --name "$(webAppName)" \
+                  --output none
+
+                principal_id=$(az webapp identity show \
+                  --resource-group "$(webAppResourceGroup)" \
+                  --name "$(webAppName)" \
+                  --query principalId -o tsv)
+
+                if [[ -z "$principal_id" ]]; then
+                  echo "Unable to resolve managed identity principalId for web app $(webAppName)."
+                  exit 1
+                fi
+
+                acr_id=$(az acr show \
+                  --name "$(acrName)" \
+                  --resource-group "$(webAppResourceGroup)" \
+                  --query id -o tsv)
+
+                az role assignment create \
+                  --assignee-object-id "$principal_id" \
+                  --assignee-principal-type ServicePrincipal \
+                  --role AcrPull \
+                  --scope "$acr_id" \
+                  --output none || true
+
+                if [[ "$(modelSource)" == "azure_blob" ]]; then
+                  storage_account_name=$(echo "$(azureStorageAccountUrl)" | sed -E 's#https://([^.]+)\..*#\1#')
+
+                  if [[ -z "$storage_account_name" || "$storage_account_name" == "$(azureStorageAccountUrl)" ]]; then
+                    echo "Unable to parse storage account name from azureStorageAccountUrl=$(azureStorageAccountUrl)."
+                    exit 1
+                  fi
+
+                  storage_account_id=$(az storage account show \
+                    --name "$storage_account_name" \
+                    --resource-group "$(webAppResourceGroup)" \
+                    --query id -o tsv)
+
+                  if [[ -z "$storage_account_id" ]]; then
+                    echo "Unable to resolve storage account id for '$storage_account_name'."
+                    exit 1
+                  fi
+
+                  az role assignment create \
+                    --assignee-object-id "$principal_id" \
+                    --assignee-principal-type ServicePrincipal \
+                    --role "Storage Blob Data Reader" \
+                    --scope "$storage_account_id" \
+                    --output none || true
+                fi
+
+                if [[ -n "$(keyVaultName)" ]]; then
+                  keyvault_id=$(az keyvault show \
+                    --name "$(keyVaultName)" \
+                    --resource-group "$(webAppResourceGroup)" \
+                    --query id -o tsv)
+
+                  if [[ -z "$keyvault_id" ]]; then
+                    echo "Unable to resolve Key Vault id for $(keyVaultName)."
+                    exit 1
+                  fi
+
+                  az role assignment create \
+                    --assignee-object-id "$principal_id" \
+                    --assignee-principal-type ServicePrincipal \
+                    --role "Key Vault Secrets User" \
+                    --scope "$keyvault_id" \
+                    --output none || true
+                fi
+
+                az webapp config set \
+                  --resource-group "$(webAppResourceGroup)" \
+                  --name "$(webAppName)" \
+                  --generic-configurations '{"acrUseManagedIdentityCreds": true}' \
+                  --output none
+
+                az webapp config container set \
+                  --resource-group "$(webAppResourceGroup)" \
+                  --name "$(webAppName)" \
+                  --container-image-name "$image_name" \
+                  --container-registry-url "https://${acr_login_server}" \
+                  --output none
 
                 az webapp config appsettings set \
                   --resource-group "$(webAppResourceGroup)" \
@@ -138,6 +316,7 @@ stages:
                     APP_ENV="production" \
                     MODEL_SOURCE="$(modelSource)" \
                     MODEL_LOCAL_DIR="$(modelLocalDir)" \
+                    AZURE_STORAGE_ACCOUNT_URL="$(azureStorageAccountUrl)" \
                     AZURE_BLOB_CONTAINER="$(azureBlobContainer)" \
                     AZURE_BLOB_PREFIX="$(azureBlobPrefix)" \
                   --output none
