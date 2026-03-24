@@ -4,7 +4,7 @@ Dedicated FastAPI backend for inference APIs used by `pneumorpheus-app`.
 
 ## What this server provides
 
-- `GET /health` health endpoint
+- `GET /cancer` service-status endpoint
 - `POST /infer` inference endpoint compatible with `pneumorpheus-app`
 - `POST /v1/infer` versioned alias of the same endpoint
 - Optional bearer token auth via `INFERENCE_API_KEY`
