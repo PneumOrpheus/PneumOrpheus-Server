@@ -39,10 +39,25 @@ docker run --rm -p 8001:8001 --env-file .env pneumorpheus-inference-server
 
 A dedicated pipeline is included in [azure-pipelines.yml](azure-pipelines.yml):
 
+- Provision (optional): creates resource group, ACR, App Service plan, and Web App on first run
 - Validate: dependency install + Python compile check
-- Containerize: build/push to ACR
-- Deploy (optional): deploy container to Azure Web App for Containers
+- Containerize: builds and pushes image in ACR using `az acr build`
+- Deploy (optional): deploys container to Azure Web App for Containers
 - Pre-deploy validation for required variables / Key Vault secret
+
+### Required pipeline variables for first deployment
+
+- `azureSubscriptionServiceConnection`
+- `webAppResourceGroup`
+- `webAppName`
+- `acrName`
+- `appServicePlanName`
+- `azureLocation`
+
+Optional but recommended:
+
+- `createInfrastructure=true` for initial run (set `false` after resources exist)
+- `keyVaultName` and `keyVaultInferenceApiKeySecretName`
 
 Recommended App Service settings:
 
@@ -50,6 +65,39 @@ Recommended App Service settings:
 - `INFERENCE_API_KEY` (optional, pull from Key Vault)
 - `MODEL_SOURCE=azure_blob` (or `local`)
 - `AZURE_STORAGE_ACCOUNT_URL`, `AZURE_BLOB_CONTAINER`, `AZURE_BLOB_PREFIX`
+
+Important: Azure Blob in this server setup is intended for model artifacts. Uploaded DICOM/NIfTI studies are not stored by this server in Azure Blob in the current flow.
+
+### Model artifact layout in Blob
+
+For `MODEL_SOURCE=azure_blob`, place artifacts under:
+
+`<AZURE_BLOB_PREFIX>/<DEFAULT_MODEL_NAME>/<DEFAULT_MODEL_VERSION>/`
+
+Example with your current settings:
+
+`models/pneumorpheus-primary/v1/`
+
+Recommended files:
+
+- `model.pth` or `model.pt`
+- `model_config.json` (optional but recommended)
+
+Example `model_config.json`:
+
+```json
+{
+	"model_file": "model.pth",
+	"model_factory": "my_models.factory:create_model",
+	"model_factory_kwargs": {
+		"in_channels": 1,
+		"out_channels": 3
+	},
+	"preprocessor_factory": "my_models.preprocess:from_study_bytes"
+}
+```
+
+If no `preprocessor_factory` is configured, the runtime uses a zero-tensor fallback input shape from `MODEL_INPUT_SHAPE` to keep the inference path operational until full study preprocessing is integrated.
 
 ## Model placement recommendation (production)
 
