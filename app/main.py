@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 
 from app.config import get_settings
-from app.routes.health import router as health_router
+from app.routes.cancer import router as cancer_router
 from app.routes.inference import router as inference_router
 
 settings = get_settings()
@@ -13,5 +13,5 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-app.include_router(health_router)
+app.include_router(cancer_router)
 app.include_router(inference_router)

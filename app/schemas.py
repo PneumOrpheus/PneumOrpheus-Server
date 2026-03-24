@@ -47,5 +47,5 @@ class InferenceResponse(BaseModel):
     modelInfo: dict[str, Any] = Field(default_factory=dict)
 
 
-class HealthResponse(BaseModel):
+class DiagnosisResponse(BaseModel):
     status: str
