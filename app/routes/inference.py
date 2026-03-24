@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from app.schemas import InferenceResponse
 from app.security import verify_api_key
-from app.services.inference_service import InferenceInput, InferenceService
+from app.services.inference_service import InferenceInput, InferenceService, InferenceServiceError
 
 router = APIRouter(tags=["inference"])
 service = InferenceService()
@@ -32,4 +32,7 @@ async def infer(
         file_bytes=file_bytes,
     )
 
-    return service.run(payload)
+    try:
+        return service.run(payload)
+    except InferenceServiceError as error:
+        raise HTTPException(status_code=503, detail=f"Inference service unavailable: {error}") from error
