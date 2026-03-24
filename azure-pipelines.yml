@@ -14,7 +14,7 @@ pr:
 
 variables:
   pythonVersion: "3.12"
-  azureSubscriptionServiceConnection: "YOUR_AZURE_SUBSCRIPTION_SERVICE_CONNECTION"
+  azureSubscriptionServiceConnection: "prod-pneumorpheus-server"
   azureLocation: "northeurope"
   createInfrastructure: "true"
 
@@ -233,6 +233,11 @@ stages:
                   --name "$(webAppName)" \
                   --query principalId -o tsv)
 
+                if [[ -z "$principal_id" ]]; then
+                  echo "Unable to resolve managed identity principalId for web app $(webAppName)."
+                  exit 1
+                fi
+
                 acr_id=$(az acr show \
                   --name "$(acrName)" \
                   --resource-group "$(webAppResourceGroup)" \
@@ -244,6 +249,51 @@ stages:
                   --role AcrPull \
                   --scope "$acr_id" \
                   --output none || true
+
+                if [[ "$(modelSource)" == "azure_blob" ]]; then
+                  storage_account_name=$(echo "$(azureStorageAccountUrl)" | sed -E 's#https://([^.]+)\..*#\1#')
+
+                  if [[ -z "$storage_account_name" || "$storage_account_name" == "$(azureStorageAccountUrl)" ]]; then
+                    echo "Unable to parse storage account name from azureStorageAccountUrl=$(azureStorageAccountUrl)."
+                    exit 1
+                  fi
+
+                  storage_account_id=$(az storage account show \
+                    --name "$storage_account_name" \
+                    --resource-group "$(webAppResourceGroup)" \
+                    --query id -o tsv)
+
+                  if [[ -z "$storage_account_id" ]]; then
+                    echo "Unable to resolve storage account id for '$storage_account_name'."
+                    exit 1
+                  fi
+
+                  az role assignment create \
+                    --assignee-object-id "$principal_id" \
+                    --assignee-principal-type ServicePrincipal \
+                    --role "Storage Blob Data Reader" \
+                    --scope "$storage_account_id" \
+                    --output none || true
+                fi
+
+                if [[ -n "$(keyVaultName)" ]]; then
+                  keyvault_id=$(az keyvault show \
+                    --name "$(keyVaultName)" \
+                    --resource-group "$(webAppResourceGroup)" \
+                    --query id -o tsv)
+
+                  if [[ -z "$keyvault_id" ]]; then
+                    echo "Unable to resolve Key Vault id for $(keyVaultName)."
+                    exit 1
+                  fi
+
+                  az role assignment create \
+                    --assignee-object-id "$principal_id" \
+                    --assignee-principal-type ServicePrincipal \
+                    --role "Key Vault Secrets User" \
+                    --scope "$keyvault_id" \
+                    --output none || true
+                fi
 
                 az webapp config set \
                   --resource-group "$(webAppResourceGroup)" \
