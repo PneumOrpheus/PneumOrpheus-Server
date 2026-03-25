@@ -15,7 +15,7 @@ pr:
 variables:
   pythonVersion: "3.12"
   azureSubscriptionServiceConnection: "prod-pneumorpheus-server"
-  azureLocation: "northeurope"
+  azureLocation: "westeurope"
   createInfrastructure: "true"
 
   acrName: "pneumorpheusacr"
@@ -95,7 +95,7 @@ stages:
                   az appservice plan create \
                     --name "$(appServicePlanName)" \
                     --resource-group "$(webAppResourceGroup)" \
-                    --sku P1v4 \
+                    --sku B1 \
                     --is-linux \
                     --output none
                 fi
