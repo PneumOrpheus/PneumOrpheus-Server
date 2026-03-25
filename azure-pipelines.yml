@@ -95,7 +95,7 @@ stages:
                   az appservice plan create \
                     --name "$(appServicePlanName)" \
                     --resource-group "$(webAppResourceGroup)" \
-                    --sku B1 \
+                    --sku P1v4 \
                     --is-linux \
                     --output none
                 fi
