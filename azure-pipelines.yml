@@ -240,6 +240,21 @@ stages:
                 acr_login_server="$(acrName).azurecr.io"
                 image_name="${acr_login_server}/$(inferenceImageRepository):$(tag)"
 
+                if ! az webapp show --name "$(webAppName)" --resource-group "$(webAppResourceGroup)" >/dev/null 2>&1; then
+                  if ! az appservice plan show --name "$(appServicePlanName)" --resource-group "$(webAppResourceGroup)" >/dev/null 2>&1; then
+                    echo "Web App $(webAppName) does not exist and App Service plan $(appServicePlanName) was not found in $(webAppResourceGroup)."
+                    echo "Create the plan first or set createInfrastructure=true for a bootstrap run."
+                    exit 1
+                  fi
+
+                  az webapp create \
+                    --name "$(webAppName)" \
+                    --resource-group "$(webAppResourceGroup)" \
+                    --plan "$(appServicePlanName)" \
+                    --deployment-container-image-name "mcr.microsoft.com/azuredocs/aci-helloworld" \
+                    --output none
+                fi
+
                 az webapp identity assign \
                   --resource-group "$(webAppResourceGroup)" \
                   --name "$(webAppName)" \
