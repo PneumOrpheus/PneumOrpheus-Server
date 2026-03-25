@@ -15,8 +15,8 @@ pr:
 variables:
   pythonVersion: "3.12"
   azureSubscriptionServiceConnection: "prod-pneumorpheus-server"
-  azureLocation: "westeurope"
-  createInfrastructure: "true"
+  azureLocation: "northeurope"
+  createInfrastructure: "false"
 
   acrName: "pneumorpheusacr"
   appServicePlanName: "pneumorpheus-plan"
