@@ -55,6 +55,23 @@ stages:
               inlineScript: |
                 set -euo pipefail
 
+                ensure_provider_registered() {
+                  local namespace="$1"
+                  local state
+
+                  state=$(az provider show --namespace "$namespace" --query registrationState -o tsv 2>/dev/null || echo "NotRegistered")
+                  if [[ "$state" != "Registered" ]]; then
+                    echo "Registering resource provider: $namespace"
+                    az provider register --namespace "$namespace" --wait --output none
+                  fi
+                }
+
+                ensure_provider_registered "Microsoft.Resources"
+                ensure_provider_registered "Microsoft.ContainerRegistry"
+                ensure_provider_registered "Microsoft.Web"
+                ensure_provider_registered "Microsoft.KeyVault"
+                ensure_provider_registered "Microsoft.Storage"
+
                 if [[ -z "$(webAppResourceGroup)" || -z "$(webAppName)" || -z "$(acrName)" || -z "$(appServicePlanName)" ]]; then
                   echo "webAppResourceGroup, webAppName, acrName and appServicePlanName are required for createInfrastructure=true."
                   exit 1
