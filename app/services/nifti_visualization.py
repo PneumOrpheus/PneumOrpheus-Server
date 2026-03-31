@@ -1,0 +1,195 @@
+from __future__ import annotations
+
+import base64
+from dataclasses import dataclass
+from io import BytesIO
+from tempfile import NamedTemporaryFile
+from typing import Any, cast
+
+import nibabel as nib
+import numpy as np
+from PIL import Image
+
+
+MAX_RENDERED_SLICES = 28
+RENDER_SIZE = (320, 320)
+
+
+@dataclass
+class VolumeData:
+    image: np.ndarray
+    mask: np.ndarray | None
+
+
+def build_nifti_visualization(file_name: str, file_bytes: bytes, runtime_result: dict[str, Any]) -> dict[str, Any] | None:
+    if not _looks_like_nifti(file_name):
+        return None
+
+    try:
+        volume = _load_volume(file_name=file_name, file_bytes=file_bytes, runtime_result=runtime_result)
+    except Exception:
+        return None
+
+    if volume.image.ndim != 3 or min(volume.image.shape) <= 1:
+        return None
+
+    slice_indices = _select_slice_indices(volume.image, volume.mask)
+    if not slice_indices:
+        return None
+
+    slices: list[dict[str, Any]] = []
+    for slice_index in slice_indices:
+        image = volume.image[:, :, slice_index]
+        mask_slice = volume.mask[:, :, slice_index] if volume.mask is not None else None
+
+        rendered, mask_coverage = _render_slice(image, mask_slice)
+        slices.append(
+            {
+                "sliceIndex": int(slice_index),
+                "imageDataUrl": rendered,
+                "hasMask": bool(mask_slice is not None and np.any(mask_slice > 0)),
+                "maskCoverage": round(mask_coverage, 6),
+            }
+        )
+
+    default_slice = _choose_default_slice(slices)
+
+    return {
+        "format": "slice-overlay-v1",
+        "imageFormat": "image/jpeg",
+        "orientation": "axial",
+        "totalSlices": int(volume.image.shape[2]),
+        "defaultSliceIndex": int(default_slice),
+        "slices": slices,
+    }
+
+
+def _looks_like_nifti(file_name: str) -> bool:
+    lower = file_name.lower().strip()
+    return lower.endswith(".nii") or lower.endswith(".nii.gz")
+
+
+def _load_volume(file_name: str, file_bytes: bytes, runtime_result: dict[str, Any]) -> VolumeData:
+    suffix = ".nii.gz" if file_name.lower().endswith(".nii.gz") else ".nii"
+    with NamedTemporaryFile(suffix=suffix) as temp_file:
+        temp_file.write(file_bytes)
+        temp_file.flush()
+
+        nifti = cast(nib.Nifti1Image, nib.load(temp_file.name))
+        image = np.asarray(nifti.get_fdata(dtype=np.float32), dtype=np.float32)
+
+    image = _ensure_3d(image)
+
+    mask = _extract_mask(runtime_result=runtime_result, expected_shape=image.shape)
+
+    return VolumeData(image=image, mask=mask)
+
+
+def _extract_mask(runtime_result: dict[str, Any], expected_shape: tuple[int, int, int]) -> np.ndarray | None:
+    candidates = [
+        runtime_result.get("mask_volume"),
+        runtime_result.get("maskVolume"),
+        runtime_result.get("segmentation_mask"),
+        runtime_result.get("segmentationMask"),
+    ]
+
+    segmentation_data = runtime_result.get("segmentation_data")
+    if isinstance(segmentation_data, dict):
+        candidates.extend(
+            [
+                segmentation_data.get("mask_volume"),
+                segmentation_data.get("maskVolume"),
+                segmentation_data.get("segmentation_mask"),
+                segmentation_data.get("segmentationMask"),
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+
+        try:
+            parsed = np.asarray(candidate, dtype=np.float32)
+        except Exception:
+            continue
+
+        parsed = _ensure_3d(parsed)
+        if parsed.shape != expected_shape:
+            continue
+
+        return (parsed > 0).astype(np.uint8)
+
+    return None
+
+
+def _ensure_3d(image: np.ndarray) -> np.ndarray:
+    squeezed = np.squeeze(image)
+    if squeezed.ndim == 4:
+        squeezed = squeezed[..., 0]
+    return np.asarray(squeezed, dtype=np.float32)
+
+
+def _select_slice_indices(image: np.ndarray, mask: np.ndarray | None) -> list[int]:
+    depth = image.shape[2]
+    if depth <= MAX_RENDERED_SLICES:
+        return list(range(depth))
+
+    if mask is not None:
+        mask_presence = np.any(mask > 0, axis=(0, 1))
+        mask_slices = np.flatnonzero(mask_presence)
+        if mask_slices.size > 0:
+            return _sample_evenly(mask_slices.tolist(), MAX_RENDERED_SLICES)
+
+    return _sample_evenly(list(range(depth)), MAX_RENDERED_SLICES)
+
+
+def _sample_evenly(indices: list[int], target_count: int) -> list[int]:
+    if len(indices) <= target_count:
+        return indices
+
+    samples = np.linspace(0, len(indices) - 1, num=target_count)
+    return sorted({indices[int(round(position))] for position in samples})
+
+
+def _render_slice(image_slice: np.ndarray, mask_slice: np.ndarray | None) -> tuple[str, float]:
+    normalized = _normalize_slice(image_slice)
+    base_rgb = np.stack([normalized, normalized, normalized], axis=-1)
+
+    mask_coverage = 0.0
+    if mask_slice is not None and np.any(mask_slice > 0):
+        mask = mask_slice > 0
+        mask_coverage = float(np.mean(mask))
+        overlay_color = np.array([255.0, 45.0, 45.0], dtype=np.float32)
+        alpha = 0.34
+        base_rgb = base_rgb.astype(np.float32)
+        base_rgb[mask] = (1.0 - alpha) * base_rgb[mask] + alpha * overlay_color
+
+    image = Image.fromarray(base_rgb.astype(np.uint8), mode="RGB")
+    image = image.resize(RENDER_SIZE, resample=Image.Resampling.BILINEAR)
+
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=84)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}", mask_coverage
+
+
+def _normalize_slice(image_slice: np.ndarray) -> np.ndarray:
+    finite_values = image_slice[np.isfinite(image_slice)]
+    if finite_values.size == 0:
+        return np.zeros_like(image_slice, dtype=np.uint8)
+
+    low = float(np.percentile(finite_values, 1.0))
+    high = float(np.percentile(finite_values, 99.0))
+    if high <= low:
+        high = low + 1e-6
+
+    clipped = np.clip(image_slice, low, high)
+    scaled = ((clipped - low) / (high - low)) * 255.0
+    return scaled.astype(np.uint8)
+
+
+def _choose_default_slice(slices: list[dict[str, Any]]) -> int:
+    with_mask = [slice_item for slice_item in slices if slice_item.get("hasMask")]
+    source = with_mask if with_mask else slices
+    middle_index = len(source) // 2
+    return int(source[middle_index]["sliceIndex"])

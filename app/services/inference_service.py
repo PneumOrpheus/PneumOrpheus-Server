@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from app.config import get_settings
-from app.schemas import ClassificationItem, InferenceResponse, SegmentationData, SegmentationRegion, SourceFileMetadata
+from app.schemas import ClassificationItem, InferenceResponse, SourceFileMetadata
 from app.services.model_runtime import ModelRuntime
 from app.services.model_store import ModelStore
+from app.services.nifti_visualization import build_nifti_visualization
 
 
 @dataclass
@@ -41,6 +42,21 @@ class InferenceService:
         confidence = float(runtime_result.get("confidence") or 0.0)
         confidence = max(0.0, min(1.0, confidence))
         proposed_tnm = str(runtime_result.get("tnm") or self.settings.model_default_tnm_stage)
+        visualization = build_nifti_visualization(
+            file_name=payload.file_name,
+            file_bytes=payload.file_bytes,
+            runtime_result=runtime_result,
+        )
+
+        segmentation_data = runtime_result.get("segmentation_data")
+        if not isinstance(segmentation_data, dict):
+            segmentation_data = {}
+
+        if visualization:
+            segmentation_data["visualization"] = visualization
+
+        if not segmentation_data:
+            segmentation_data = None
 
         findings = (
             f"Model predicts {predicted_type} with {round(confidence * 100)}% confidence "
@@ -78,24 +94,7 @@ class InferenceService:
                     explanation="Secondary right-side suspicious region with supporting radiographic traits.",
                 ),
             ],
-            segmentationData=SegmentationData(
-                format="polygon",
-                labels=["tumor", "nodule"],
-                regions=[
-                    SegmentationRegion(
-                        id="region-1",
-                        label="tumor",
-                        sliceIndex=42,
-                        points=[[120, 88], [158, 92], [162, 133], [124, 130]],
-                    ),
-                    SegmentationRegion(
-                        id="region-2",
-                        label="nodule",
-                        sliceIndex=47,
-                        points=[[210, 160], [228, 164], [232, 184], [214, 182]],
-                    ),
-                ],
-            ),
+            segmentationData=segmentation_data,
             modelInfo={
                 "modelName": model_name,
                 "modelVersion": model_version,
