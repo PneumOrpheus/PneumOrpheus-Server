@@ -16,19 +16,6 @@ class ClassificationItem(BaseModel):
     explanation: str
 
 
-class SegmentationRegion(BaseModel):
-    id: str
-    label: str
-    sliceIndex: int
-    points: list[list[int]]
-
-
-class SegmentationData(BaseModel):
-    format: str = "polygon"
-    labels: list[str]
-    regions: list[SegmentationRegion]
-
-
 class InferenceResponse(BaseModel):
     analysisId: str
     patientId: str
@@ -43,7 +30,7 @@ class InferenceResponse(BaseModel):
     reasoning: str
     proposedTnmStage: str
     classifications: list[ClassificationItem]
-    segmentationData: SegmentationData
+    segmentationData: dict[str, Any] | None = None
     modelInfo: dict[str, Any] = Field(default_factory=dict)
 
 
