@@ -13,10 +13,11 @@ pr:
       - develop
 
 variables:
+  agentPoolName: "PneumOrpheusPool"
   pythonVersion: "3.12"
   azureSubscriptionServiceConnection: "prod-pneumorpheus-server"
   azureLocation: "northeurope"
-  createInfrastructure: "false"
+  createInfrastructure: "true"
 
   acrName: "pneumorpheusacr"
   appServicePlanName: "pneumorpheus-plan"
@@ -43,7 +44,7 @@ stages:
       - job: Bootstrap
         displayName: "Create Azure resources if missing"
         pool:
-          vmImage: "ubuntu-latest"
+          name: "$(agentPoolName)"
         steps:
           - task: AzureCLI@2
             displayName: "Provision resource group, ACR, plan, web app"
@@ -126,20 +127,17 @@ stages:
       - job: PythonChecks
         displayName: "Python compile check"
         pool:
-          vmImage: "ubuntu-latest"
+          name: "$(agentPoolName)"
         steps:
           - checkout: self
 
-          - task: UsePythonVersion@0
-            inputs:
-              versionSpec: "$(pythonVersion)"
-
           - script: |
-              python -m pip install --upgrade pip
-              pip install -r requirements.txt
+              python3 --version
+              python3 -m pip install --upgrade pip
+              python3 -m pip install -r requirements.txt
             displayName: "Install dependencies"
 
-          - script: python -m compileall app
+          - script: python3 -m compileall app
             displayName: "Compile app"
 
   - stage: Containerize
@@ -149,7 +147,7 @@ stages:
     jobs:
       - job: BuildPush
         pool:
-          vmImage: "ubuntu-latest"
+          name: "$(agentPoolName)"
         steps:
           - checkout: self
 
@@ -181,7 +179,7 @@ stages:
     jobs:
       - job: DeployContainer
         pool:
-          vmImage: "ubuntu-latest"
+          name: "$(agentPoolName)"
         steps:
           - task: AzureCLI@2
             displayName: "Pre-deploy validation"
