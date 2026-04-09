@@ -16,13 +16,13 @@ variables:
   agentPoolName: "PneumOrpheusPool"
   pythonVersion: "3.12"
   azureSubscriptionServiceConnection: "prod-pneumorpheus-server"
-  azureLocation: "northeurope"
+  azureLocation: "norwayeast"
   createInfrastructure: "true"
 
   acrName: "pneumorpheusacr"
   appServicePlanName: "pneumorpheus-plan"
   keyVaultName: "PneumOrpheus"
-  webAppResourceGroup: "AI-Diagnostics"
+  webAppResourceGroup: "AI-Diagnostics-Norway"
   keyVaultInferenceApiKeySecretName: "MODEL-INFERENCE-API-KEY"
 
   inferenceImageRepository: "pneumorpheus-inference-server"
