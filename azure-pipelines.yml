@@ -2,15 +2,11 @@ trigger:
   branches:
     include:
       - production
-      - main
-      - develop
 
 pr:
   branches:
     include:
       - production
-      - main
-      - develop
 
 variables:
   agentPoolName: "PneumOrpheusPool"
