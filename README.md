@@ -1,140 +1,140 @@
 # PneumOrpheus Inference Server
 
-Dedicated FastAPI backend for inference APIs used by `pneumorpheus-app`.
+The PneumOrpheus Inference Server is the clinical AI processing service behind the PneumOrpheus platform.
+It receives imaging studies and clinical metadata from the PneumOrpheus application, executes model inference, and returns structured, explainable outputs for report generation.
 
-## What this server provides
+## Service Purpose
 
-- `GET /cancer` service-status endpoint
-- `POST /infer` inference endpoint compatible with `pneumorpheus-app`
-- `POST /v1/infer` versioned alias of the same endpoint
-- Optional bearer token auth via `INFERENCE_API_KEY`
+- Transform uploaded chest imaging studies into clinically reviewable AI outputs.
+- Provide consistent, machine-readable response fields for downstream report workflows.
+- Support explainability with confidence, rationale, regional predictions, and visualization-ready segmentation data.
+- Operate as an isolated inference layer so model serving can scale and evolve independently.
 
-The multipart contract matches the app request shape:
+## Where It Fits in the Platform
 
-- `analysisId`
-- `patientId`
-- `patientName`
-- `modality`
-- `clinicianEmail`
-- `studyFile`
+PneumOrpheus uses a layered architecture:
 
-## Local run
+- Clinical application layer: case intake, report review, patient tracking.
+- Inference server layer (this service): model execution and standardized AI output.
+- Clinical data layer: long-term report and patient record persistence in the app domain.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+In short, this server is the decision-support computation engine, while the application remains the clinician-facing workflow environment.
+
+## Inference Workflow
+
+1. A new case is submitted from PneumOrpheus with patient and study metadata.
+2. The server validates the request and receives study bytes in memory.
+3. The selected model artifact is resolved from the configured model source.
+4. Runtime inference executes and produces prediction outputs.
+5. The server enriches the result with standardized fields.
+6. A structured response is returned to the application for report assembly and clinician review.
+
+## System Architecture
+
+### 1) API Gateway Layer
+
+- Exposes inference and service-health endpoints.
+- Accepts multipart clinical submission payloads.
+- Supports optional bearer-token protection for controlled access.
+
+### 2) Orchestration Layer
+
+- Builds a normalized inference input object from request content.
+- Coordinates model artifact retrieval and runtime execution.
+- Converts runtime output into the platform response schema.
+
+### 3) Model Artifact Layer
+
+- Resolves model assets from local or cloud-backed model storage.
+- Supports model versioning and cached retrieval.
+- Enables reproducible model selection by name and version.
+
+### 4) Runtime Inference Layer
+
+- Loads model artifacts and executes forward-pass inference.
+- Produces class predictions and confidence estimates.
+- Returns structured reasoning and staging fields expected by the clinical application.
+
+### 5) Imaging Visualization Layer
+
+- Builds optional visualization payloads for NIfTI studies.
+- Adds slice-level, viewer-friendly segmentation content when available.
+
+## High-Level Data Flow
+
+```mermaid
+flowchart LR
+	A[Clinical App Case Submission] --> B[Inference API]
+	B --> C[Inference Service]
+	C --> D[Model Store and Version Resolver]
+	C --> E[Model Runtime]
+	E --> F[Prediction and Confidence]
+	C --> G[Segmentation and Visualization Builder]
+	C --> H[Standardized Inference Response]
+	H --> A
 ```
 
-## Docker run
+## Input Contract (Clinical Request)
 
-```bash
-docker build -t pneumorpheus-inference-server .
-docker run --rm -p 8001:8001 --env-file .env pneumorpheus-inference-server
-```
+Each inference request includes:
 
-## Azure DevOps
+- Analysis identifier
+- Patient identifier
+- Patient name
+- Imaging modality
+- Clinician email
+- Study file (DICOM or NIfTI workflow input)
 
-A dedicated pipeline is included in [azure-pipelines.yml](azure-pipelines.yml):
+This structure allows deterministic linkage between uploaded study, generated output, and downstream clinical reporting.
 
-- Provision (optional): creates resource group, ACR, App Service plan, and Web App on first run
-- Validate: dependency install + Python compile check
-- Containerize: builds and pushes image in ACR using `az acr build`
-- Deploy (optional): deploys container to Azure Web App for Containers
-- Pre-deploy validation for required variables / Key Vault secret
+## Output Contract (Clinical Response)
 
-### Required pipeline variables for first deployment
+Each response can include:
 
-- `azureSubscriptionServiceConnection`
-- `webAppResourceGroup`
-- `webAppName`
-- `acrName`
-- `appServicePlanName`
-- `azureLocation`
+- Case identifiers and processing timestamp
+- Source file metadata
+- Findings summary
+- Predicted cancer type
+- Classification confidence
+- Reasoning text
+- Proposed TNM stage
+- Side/region-level classification entries
+- Optional segmentation/visualization payload
+- Model metadata for traceability
 
-Optional but recommended:
+## Privacy and Data Handling
 
-- `createInfrastructure=true` for initial run (set `false` after resources exist)
-- `keyVaultName` and `keyVaultInferenceApiKeySecretName`
+- Study bytes are processed in-memory for inference.
+- The inference server focuses on computation and response generation, not long-term study-file archival.
+- Security controls can require authenticated bearer access for inbound requests.
+- Outputs are returned in a constrained, structured schema to support controlled downstream handling.
 
-Recommended App Service settings:
+## Reliability and Operational Behavior
 
-- `WEBSITES_PORT=8001`
-- `INFERENCE_API_KEY` (optional, pull from Key Vault)
-- `MODEL_SOURCE=azure_blob` (or `local`)
-- `AZURE_STORAGE_ACCOUNT_URL`, `AZURE_BLOB_CONTAINER`, `AZURE_BLOB_PREFIX`
+- Includes a dedicated health endpoint for service availability checks.
+- Supports stable and versioned inference routes.
+- Uses model caching and deterministic model resolution to reduce runtime volatility.
+- Keeps inference logic and model management decoupled to support safer model lifecycle updates.
 
-Important: Azure Blob in this server setup is intended for model artifacts. Uploaded DICOM/NIfTI studies are not stored by this server in Azure Blob in the current flow.
+## Explainability Support
 
-### Model artifact layout in Blob
+The server is designed to provide interpretable outputs, not just raw class labels.
+Depending on model/runtime capabilities, responses may include:
 
-For `MODEL_SOURCE=azure_blob`, place artifacts under:
+- Confidence-calibrated predictions
+- Narrative reasoning text
+- Side-level diagnostic suggestions
+- Visualization-ready segmentation slices
 
-`<AZURE_BLOB_PREFIX>/<DEFAULT_MODEL_NAME>/<DEFAULT_MODEL_VERSION>/`
+These outputs are intended to strengthen clinician review, not automate final diagnosis.
 
-Example with your current settings:
+## Safety and Intended Use
 
-`models/pneumorpheus-primary/v1/`
+- The inference server is a clinical decision-support component.
+- It is not a standalone diagnostic authority.
+- Final interpretation, diagnosis, and treatment decisions remain with qualified healthcare professionals.
+- AI outputs should always be interpreted alongside imaging evidence, patient context, and institutional policy.
 
-Recommended files:
+## Summary
 
-- `model.pth` or `model.pt`
-- `model_config.json` (optional but recommended)
-
-Example `model_config.json`:
-
-```json
-{
-	"model_file": "model.pth",
-	"model_factory": "my_models.factory:create_model",
-	"model_factory_kwargs": {
-		"in_channels": 1,
-		"out_channels": 3
-	},
-	"preprocessor_factory": "my_models.preprocess:from_study_bytes"
-}
-```
-
-If no `preprocessor_factory` is configured, the runtime uses a zero-tensor fallback input shape from `MODEL_INPUT_SHAPE` to keep the inference path operational until full study preprocessing is integrated.
-
-## Model placement recommendation (production)
-
-For your case (models currently in another location), the smartest production approach is:
-
-1. **Store versioned model artifacts in Azure Blob Storage or Azure ML Model Registry**.
-2. **Deploy this inference server separately** (yes, through Azure DevOps is the right choice).
-3. **Use managed identity** from the inference app to pull model artifacts (avoid embedding storage keys).
-4. **Pin model name/version via environment variables** for reproducibility.
-5. **Cache model files on local disk/container volume** (`MODEL_CACHE_DIR`) to avoid repeated downloads.
-
-### Why this is preferable
-
-- Clear separation of concerns (UI/API app vs inference runtime)
-- Independent scaling and rollout of model-serving container
-- Safer secret handling with Key Vault + managed identity
-- Better traceability of model versions tied to predictions
-
-## Integration with pneumorpheus-app
-
-Set the app environment variable:
-
-```bash
-INFERENCE_API_URL=https://<your-inference-service>/infer
-```
-
-If auth is enabled on this server, also set in app:
-
-```bash
-INFERENCE_API_KEY=<same bearer token>
-```
-
-## Where to plug real model inference
-
-Replace the placeholder logic in:
-
-- `app/services/model_runtime.py`
-- `app/services/inference_service.py`
-
-Keep response fields unchanged so the current app parser in `app/api/reports/route.ts` continues to work.
+The PneumOrpheus Inference Server provides the model-serving backbone of the PneumOrpheus ecosystem: secure clinical request intake, version-aware model execution, standardized explainable outputs, and integration-ready response delivery for clinician-facing report workflows.
