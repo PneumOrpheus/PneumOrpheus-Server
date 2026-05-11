@@ -13,6 +13,8 @@ from PIL import Image
 
 MAX_RENDERED_SLICES = 28
 RENDER_SIZE = (320, 320)
+_SEG_COLOR = np.array([255.0, 45.0, 45.0], dtype=np.float32)
+_SEG_ALPHA = 0.34
 
 
 @dataclass
@@ -193,3 +195,140 @@ def _choose_default_slice(slices: list[dict[str, Any]]) -> int:
     source = with_mask if with_mask else slices
     middle_index = len(source) // 2
     return int(source[middle_index]["sliceIndex"])
+
+
+# ---------------------------------------------------------------------------
+# Three-panel MIL visualization (plain CT / seg overlay / GradCAM overlay)
+# ---------------------------------------------------------------------------
+
+def build_three_visualizations(
+    input_tensor: Any,
+    seg_per_instance: np.ndarray | None,
+    gradcam_data: tuple[np.ndarray, np.ndarray] | None,
+) -> dict[str, Any] | None:
+    """Build three slice-overlay-v1 dicts from preprocessed MIL bag slices.
+
+    input_tensor : (1, N, 1, H, W) PyTorch tensor or None
+    seg_per_instance : (N, H, W) float32 sigmoid probabilities or None
+    gradcam_data : (cam_np (N,H,W), att_np (N,)) or None
+    """
+    if input_tensor is None:
+        return None
+
+    try:
+        bag = _extract_bag_numpy(input_tensor)  # (N, H, W) float32
+    except Exception:
+        return None
+
+    N = bag.shape[0]
+
+    cam_np, att_np = (None, None)
+    if gradcam_data is not None:
+        try:
+            cam_np, att_np = gradcam_data
+            if cam_np.shape[0] != N:
+                cam_np, att_np = None, None
+        except Exception:
+            cam_np, att_np = None, None
+
+    if seg_per_instance is not None and seg_per_instance.shape[0] != N:
+        seg_per_instance = None
+
+    plain_slices: list[dict[str, Any]] = []
+    seg_slices: list[dict[str, Any]] = []
+    cam_slices: list[dict[str, Any]] = []
+
+    for i in range(N):
+        ct_slice = bag[i]  # (H, W)
+
+        # --- plain CT ---
+        rendered_plain, _ = _render_slice(ct_slice, None)
+        plain_slices.append({
+            "sliceIndex": i,
+            "imageDataUrl": rendered_plain,
+            "hasMask": False,
+            "maskCoverage": 0.0,
+        })
+
+        # --- segmentation overlay ---
+        seg_slice = seg_per_instance[i] if seg_per_instance is not None else None
+        seg_mask_bin = (seg_slice > 0.5).astype(np.uint8) if seg_slice is not None else None
+        rendered_seg, seg_cov = _render_slice(ct_slice, seg_mask_bin)
+        seg_slices.append({
+            "sliceIndex": i,
+            "imageDataUrl": rendered_seg,
+            "hasMask": bool(seg_mask_bin is not None and np.any(seg_mask_bin > 0)),
+            "maskCoverage": round(seg_cov, 6),
+        })
+
+        # --- GradCAM overlay ---
+        cam_slice = cam_np[i] if cam_np is not None else None
+        rendered_cam, cam_cov = _render_gradcam_slice(ct_slice, cam_slice)
+        cam_slices.append({
+            "sliceIndex": i,
+            "imageDataUrl": rendered_cam,
+            "hasMask": cam_slice is not None,
+            "maskCoverage": round(cam_cov, 6),
+        })
+
+    # Default slice: highest attention weight for cam/seg; middle for plain
+    if att_np is not None and len(att_np) == N:
+        default_cam = int(np.argmax(att_np))
+        default_seg = default_cam
+    else:
+        default_cam = N // 2
+        default_seg = N // 2
+    default_plain = N // 2
+
+    def _vis(slices, default):
+        return {
+            "format": "slice-overlay-v1",
+            "imageFormat": "image/jpeg",
+            "orientation": "axial",
+            "totalSlices": N,
+            "defaultSliceIndex": default,
+            "slices": slices,
+        }
+
+    return {
+        "plainCt": _vis(plain_slices, default_plain),
+        "segmentationOverlay": _vis(seg_slices, default_seg),
+        "gradCamOverlay": _vis(cam_slices, default_cam),
+    }
+
+
+def _extract_bag_numpy(input_tensor: Any) -> np.ndarray:
+    """Extract (N, H, W) float32 from (1, N, 1, H, W) tensor or ndarray."""
+    try:
+        arr = input_tensor.detach().cpu().numpy()
+    except AttributeError:
+        arr = np.asarray(input_tensor, dtype=np.float32)
+    # (1, N, 1, H, W) → (N, H, W)
+    arr = np.squeeze(arr)
+    if arr.ndim == 4:
+        # (N, 1, H, W) → (N, H, W)
+        arr = arr[:, 0, :, :]
+    return arr.astype(np.float32)
+
+
+def _render_gradcam_slice(ct_slice: np.ndarray, cam_slice: np.ndarray | None) -> tuple[str, float]:
+    """Render a CT slice with a jet-colored GradCAM overlay."""
+    from sclc.grad_cam.colorize import colorize_overlay
+
+    ct_norm = _normalize_slice(ct_slice).astype(np.float32) / 255.0  # [0, 1]
+
+    if cam_slice is not None and np.any(cam_slice > 0):
+        cam_coverage = float(np.mean(cam_slice))
+        rgb = colorize_overlay(ct_norm, cam_slice, alpha=0.55, threshold=0.10)
+    else:
+        cam_coverage = 0.0
+        gray = (ct_norm * 255.0).astype(np.uint8)
+        rgb = np.stack([gray, gray, gray], axis=-1)
+
+    image = Image.fromarray(rgb, mode="RGB")
+    image = image.resize(RENDER_SIZE, resample=Image.Resampling.BILINEAR)
+
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=84)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}", cam_coverage
