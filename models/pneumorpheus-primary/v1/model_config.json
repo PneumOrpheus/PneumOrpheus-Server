@@ -1,0 +1,21 @@
+{
+  "model_factory": "sclc.models.factory:get_sclc_model",
+  "model_file": "checkpoint.pth",
+  "model_factory_kwargs": {
+    "model_type": "mil_swinv2_tiny",
+    "use_advanced_fpn": true,
+    "use_det_seg": true,
+    "fpn_channels": 256,
+    "tfpn_enabled": true,
+    "tfpn_heads": 4,
+    "tfpn_layers": 1,
+    "mil_mode": "att",
+    "mil_trans_blocks": 4,
+    "mil_trans_dropout": 0.0
+  },
+  "preprocessor_factory": "app.services.sclc_preprocessor:preprocess_for_inference",
+  "all_heads_active": true,
+  "pipeline": "mil",
+  "img_size": 256,
+  "bag_size": 16
+}

@@ -801,7 +801,7 @@ class MILSwinV2TinyClassifier(nn.Module):
         self._last_attention = None
         if not self._use_advanced_fpn:
             swin = timm.create_model(
-                "swinv2_cr_tiny_ns_224.sw_in1k",
+                "swinv2_tiny_window8_256.ms_in1k",
                 pretrained=pretrained_backbone,
                 num_classes=0,
                 in_chans=1,
@@ -819,7 +819,7 @@ class MILSwinV2TinyClassifier(nn.Module):
             if mil_mode not in ("att", "att_trans"):
                 print(f"[MIL-SwinV2Tiny] mil_mode={mil_mode} ignored in advanced FPN mode; using attention pooling.")
             self.backbone = timm.create_model(
-                "swinv2_cr_tiny_ns_224.sw_in1k",
+                "swinv2_tiny_window8_256.ms_in1k",
                 pretrained=pretrained_backbone,
                 features_only=True,
                 out_indices=(0, 1, 2, 3),
