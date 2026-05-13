@@ -9,3 +9,6 @@ __pycache__
 .pytest_cache
 .mypy_cache
 coverage
+# Model binaries are fetched at runtime from Azure Blob; never bake them into the image
+models/
+model-cache/

@@ -6,3 +6,11 @@ __pycache__/
 .mypy_cache/
 coverage/
 *.log
+# Model files — binary artifacts, fetched from Azure Blob at runtime
+models/*.pth
+models/*.pt
+models/*.ckpt
+models/**/*.pth
+models/**/*.pt
+models/**/*.ckpt
+model-cache/

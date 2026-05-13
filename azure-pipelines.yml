@@ -131,7 +131,8 @@ stages:
               python3 --version
               python3 -m pip install --upgrade pip
               python3 -m pip install -r requirements.txt
-            displayName: "Install dependencies"
+              python3 -m pip install ./sclc_pkg
+            displayName: "Install dependencies (including bundled sclc)"
 
           - script: python3 -m compileall app
             displayName: "Compile app"
