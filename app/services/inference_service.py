@@ -11,6 +11,7 @@ from app.schemas import ClassificationItem, InferenceResponse, SourceFileMetadat
 from app.services.model_runtime import ModelRuntime
 from app.services.model_store import ModelStore
 from app.services.nifti_visualization import build_nifti_visualization, build_three_visualizations
+from app.services.segmentation_runtime import SegmentationRuntime
 from app.services.tnm_staging import derive_tnm
 
 
@@ -31,14 +32,20 @@ class InferenceService:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.model_store = ModelStore()
+        self.segmentation_runtime = SegmentationRuntime()
 
     def run(self, payload: InferenceInput) -> InferenceResponse:
         model_name = self.settings.default_model_name
         model_version = self.settings.default_model_version
         try:
+            tumor_mask = self.segmentation_runtime.segment(payload.file_bytes)
             model_path = self.model_store.resolve_model_path(model_name=model_name, model_version=model_version)
             runtime = ModelRuntime(model_path=model_path)
-            runtime_result = runtime.run(file_bytes=payload.file_bytes, modality=payload.modality)
+            runtime_result = runtime.run(
+                file_bytes=payload.file_bytes,
+                modality=payload.modality,
+                tumor_mask=tumor_mask,
+            )
         except Exception as error:
             raise InferenceServiceError(str(error)) from error
 

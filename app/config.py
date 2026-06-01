@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     model_preprocessor_factory_path: str | None = None
     model_factory_kwargs_json: str = "{}"
 
+    # Segmentation model (optional — used for tumor-positive MIL slice selection)
+    segmentation_model_path: str | None = None
+    segmentation_model_config_json: str = "{}"
+    segmentation_device: str = "cpu"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

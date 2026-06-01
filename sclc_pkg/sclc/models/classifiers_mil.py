@@ -14,21 +14,30 @@ from .classifiers_2d import SwinTiny2DClassifier
 
 
 class _MILAttentionPool(nn.Module):
-    def __init__(self, in_dim: int, num_classes: int):
+    """Gated attention pooling matching the SCLC-Diagnostic training codebase.
+
+    Dropout is always present in the Sequential (even at p=0.0) so state-dict
+    key indices match checkpoints trained with SCLC-Diagnostic:
+      att.0 Linear, att.1 Tanh, att.2 Dropout, att.3 Linear.
+    A separate Dropout is applied to the pooled representation before the
+    linear classifier.
+    """
+    def __init__(self, in_dim: int, num_classes: int, dropout: float = 0.0):
         super().__init__()
         hidden = max(64, in_dim // 2)
         self.att = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.Tanh(),
+            nn.Dropout(p=dropout),
             nn.Linear(hidden, 1),
         )
+        self.drop = nn.Dropout(p=dropout)
         self.cls = nn.Linear(in_dim, num_classes)
 
     def forward(self, feats: torch.Tensor):
-        # feats: (B, N, C)
         att = self.att(feats)
         weights = torch.softmax(att, dim=1)
-        pooled = (weights * feats).sum(dim=1)
+        pooled = self.drop((weights * feats).sum(dim=1))
         return self.cls(pooled), weights.squeeze(-1)
 
 
@@ -840,7 +849,9 @@ class MILSwinV2TinyClassifier(nn.Module):
                 use_seg=bool(use_det_seg),
                 use_det=bool(use_det_seg),
             )
-            self.att_pool = _MILAttentionPool(in_dim=fpn_channels, num_classes=num_classes)
+            self.att_pool = _MILAttentionPool(
+                in_dim=fpn_channels, num_classes=num_classes, dropout=trans_dropout
+            )
 
     def load_backbone_from_dapt(self, state_dict, logger=None):
         """Load a DAPT ``SwinV2Tiny2DClassifier`` state dict into the backbone.
@@ -934,8 +945,12 @@ class MILSwinV2TinyClassifier(nn.Module):
             if f.ndim == 4 and f.shape[-1] == expected_c and f.shape[1] != expected_c:
                 f = f.permute(0, 3, 1, 2).contiguous()
             feats_nchw.append(f)
-        fused, _ = self.fpn(feats_nchw)
-        feat_vec, seg_logits, box_pred = self.instance_head(fused, flat.shape)
+        # Use the deepest FPN level (all_fused[-1], 8×8 for 256-px input).
+        # The finest level over-smooths after AdaptiveAvgPool2d(1) → near-uniform
+        # attention; the deepest level retains per-slice semantic fingerprints.
+        # Matches SCLC-Diagnostic training behaviour.
+        _, all_fused = self.fpn(feats_nchw)
+        feat_vec, seg_logits, box_pred = self.instance_head(all_fused[-1], flat.shape)
         feat_vec = feat_vec.view(B, N, -1)
         cls_logits, att = self.att_pool(feat_vec)
         self._last_attention = att
