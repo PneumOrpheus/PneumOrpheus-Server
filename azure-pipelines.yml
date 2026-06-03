@@ -30,6 +30,11 @@ variables:
   azureBlobContainer: "models"
   azureBlobPrefix: "models"
 
+  segmentationModelName: "segmentation"
+  segmentationModelVersion: "v1"
+  segmentationModelFile: "checkpoint.pth"
+  segmentationDevice: "cpu"
+
   tag: "$(Build.SourceBranchName)-$(Build.BuildId)"
 
 stages:
@@ -346,6 +351,10 @@ stages:
                     AZURE_STORAGE_ACCOUNT_URL="$(azureStorageAccountUrl)" \
                     AZURE_BLOB_CONTAINER="$(azureBlobContainer)" \
                     AZURE_BLOB_PREFIX="$(azureBlobPrefix)" \
+                    SEGMENTATION_MODEL_NAME="$(segmentationModelName)" \
+                    SEGMENTATION_MODEL_VERSION="$(segmentationModelVersion)" \
+                    SEGMENTATION_MODEL_FILE="$(segmentationModelFile)" \
+                    SEGMENTATION_DEVICE="$(segmentationDevice)" \
                   --output none
 
                 if [[ -n "$(keyVaultInferenceApiKeySecretName)" ]]; then

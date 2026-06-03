@@ -1,16 +1,19 @@
 """Lung tumour segmentation service.
 
-Uses a MONAI-based 3-D segmentation model (UNet / AttentionUNet / SwinUNETR)
-trained with the segmentation-torch framework.  Returns a binary mask in the
-same RAS / 1×1×2 mm space used by the SCLC preprocessor so the MIL bag
-builder can select tumour-positive axial slices.
+Uses a MONAI-based 3-D segmentation model (UNet / AttentionUNet / SwinUNETR).
+Returns a binary mask in the same RAS / 1×1×2 mm space used by the SCLC
+preprocessor so the MIL bag builder can select tumour-positive axial slices.
 
-Configuration (env vars / .env):
-  SEGMENTATION_MODEL_PATH         Path to a PyTorch or Lightning checkpoint.
-  SEGMENTATION_MODEL_CONFIG_JSON  JSON with model + preprocessing params.
-  SEGMENTATION_DEVICE             "cpu" | "cuda" | "cuda:0" etc.
+Blob layout (mirrors classification model layout):
+  {AZURE_BLOB_PREFIX}/{SEGMENTATION_MODEL_NAME}/{SEGMENTATION_MODEL_VERSION}/
+      checkpoint.pth          ← weights  (filename set by SEGMENTATION_MODEL_FILE)
+      segmentation_config.json ← architecture + preprocessing params (see below)
 
-Model config JSON fields:
+When MODEL_SOURCE is not "azure_blob", set SEGMENTATION_MODEL_PATH to an
+explicit local checkpoint path and supply SEGMENTATION_MODEL_CONFIG_JSON as a
+fallback for the architecture params.
+
+segmentation_config.json fields:
   model_type            "AttentionUNet" | "UNet" | "SwinUNETR"
   nb_classes            int (default 2)
   network_shape         [H, W, D, C]  — spatial dims + input channels
@@ -29,12 +32,14 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import numpy as np
 
 from app.config import get_settings
+
+_SEG_CONFIG_FILE = "segmentation_config.json"
 
 
 class SegmentationRuntime:
@@ -43,34 +48,121 @@ class SegmentationRuntime:
         self._model = None
         self._cfg: dict[str, Any] = {}
         self._torch = None
+        self._resolved_path: Path | None = None
 
-    def _is_configured(self) -> bool:
-        p = self.settings.segmentation_model_path
-        return bool(p and Path(p).exists())
+    # ------------------------------------------------------------------
+    # Path resolution + blob download
+    # ------------------------------------------------------------------
+
+    def _resolve_model_path(self) -> Path | None:
+        """Return the local checkpoint path, downloading from blob when needed.
+
+        Also populates self._cfg from segmentation_config.json if found.
+        """
+        if self._resolved_path is not None:
+            return self._resolved_path
+
+        explicit = self.settings.segmentation_model_path
+        if explicit:
+            p = Path(explicit)
+            if p.exists():
+                self._resolved_path = p
+            return self._resolved_path
+
+        if self.settings.model_source.lower() == "azure_blob":
+            try:
+                model_dir = self._download_folder_from_blob()
+                cfg_file = model_dir / _SEG_CONFIG_FILE
+                if cfg_file.exists():
+                    self._cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+                checkpoint = model_dir / self.settings.segmentation_model_file
+                if checkpoint.exists():
+                    self._resolved_path = checkpoint
+            except Exception:
+                pass
+
+        return self._resolved_path
+
+    def _download_folder_from_blob(self) -> Path:
+        """Download all blobs under the segmentation model prefix into the local cache."""
+        from azure.identity import DefaultAzureCredential
+        from azure.storage.blob import BlobServiceClient
+
+        if not self.settings.azure_storage_account_url:
+            raise ValueError("AZURE_STORAGE_ACCOUNT_URL is required for blob segmentation model.")
+        if not self.settings.azure_blob_container:
+            raise ValueError("AZURE_BLOB_CONTAINER is required for blob segmentation model.")
+
+        name = self.settings.segmentation_model_name
+        version = self.settings.segmentation_model_version
+        prefix_parts = [self.settings.azure_blob_prefix.strip("/"), name.strip("/"), version.strip("/")]
+        blob_prefix = "/".join(p for p in prefix_parts if p)
+
+        target_dir = Path(self.settings.model_cache_dir) / name / version
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        credential = DefaultAzureCredential()
+        service = BlobServiceClient(
+            account_url=self.settings.azure_storage_account_url,
+            credential=credential,
+        )
+        container = service.get_container_client(self.settings.azure_blob_container)
+
+        blobs = list(container.list_blobs(name_starts_with=blob_prefix))
+        if not blobs:
+            raise FileNotFoundError(
+                f"No segmentation artifacts found in blob container "
+                f"'{self.settings.azure_blob_container}' for prefix '{blob_prefix}'."
+            )
+
+        for blob in blobs:
+            relative = blob.name[len(blob_prefix):].lstrip("/")
+            if not relative:
+                continue
+            dest = target_dir / PurePosixPath(relative)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with dest.open("wb") as fh:
+                container.get_blob_client(blob.name).download_blob().readinto(fh)
+
+        return target_dir
+
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
 
     def _ensure_loaded(self) -> bool:
         if self._model is not None:
             return True
-        if not self._is_configured():
+
+        model_path = self._resolve_model_path()
+        if model_path is None:
             return False
+
+        # _cfg may already be set from segmentation_config.json in blob;
+        # fall back to the env var if not.
+        if not self._cfg:
+            try:
+                self._cfg = json.loads(self.settings.segmentation_model_config_json or "{}")
+            except json.JSONDecodeError:
+                pass
+
         try:
             import torch  # noqa: F401
         except ImportError:
             return False
+
         import torch
-        try:
-            self._cfg = json.loads(self.settings.segmentation_model_config_json or "{}")
-        except json.JSONDecodeError:
-            return False
+
         try:
             self._model = self._build_model()
-            self._load_checkpoint(self._model)
+            self._load_checkpoint(self._model, model_path)
             self._model.to(torch.device(self.settings.segmentation_device))
             self._model.eval()
             self._torch = torch
         except Exception:
             self._model = None
             return False
+
         return True
 
     def _build_model(self):
@@ -105,11 +197,9 @@ class SegmentationRuntime:
             )
         raise ValueError(f"Unknown segmentation model_type: {model_type!r}")
 
-    def _load_checkpoint(self, model) -> None:
+    def _load_checkpoint(self, model, path: Path) -> None:
         import torch
-        ckpt = torch.load(
-            str(self.settings.segmentation_model_path), map_location="cpu", weights_only=False
-        )
+        ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
         sd = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
         for prefix in ("model.", "net.", ""):
             stripped = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
@@ -117,6 +207,10 @@ class SegmentationRuntime:
             if len(res.missing_keys) < len(model.state_dict()) // 2:
                 return
         model.load_state_dict(sd, strict=False)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def segment(self, file_bytes: bytes) -> np.ndarray | None:
         """Return binary 3-D mask (H×W×Z) in RAS / 1×1×2 mm space, or None."""
@@ -162,7 +256,7 @@ class SegmentationRuntime:
             tfms.append(NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True))
         elif norm_method == "scaleintensity":
             tfms.append(ScaleIntensityRanged(
-                keys=["image"], a_min=-1024, a_max=3071, b_min=0, b_max=1, clip=True
+                keys=["image"], a_min=-1024, a_max=3071, b_min=0, b_max=1, clip=True,
             ))
         tfms.append(ToTensord(keys=["image"]))
 
@@ -170,7 +264,9 @@ class SegmentationRuntime:
         device = torch.device(self.settings.segmentation_device)
         img = img.to(device)
 
-        inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=1, overlap=overlap, mode="gaussian")
+        inferer = SlidingWindowInferer(
+            roi_size=roi_size, sw_batch_size=1, overlap=overlap, mode="gaussian",
+        )
         with torch.no_grad():
             logits = inferer(img, self._model)
 
