@@ -36,3 +36,8 @@ class InferenceResponse(BaseModel):
 
 class DiagnosisResponse(BaseModel):
     status: str
+
+
+class InferenceJobAccepted(BaseModel):
+    analysisId: str
+    status: str = "processing"
