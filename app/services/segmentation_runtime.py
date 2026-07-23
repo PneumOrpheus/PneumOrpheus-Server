@@ -1,34 +1,27 @@
-"""Lung tumour segmentation service.
+"""Mediastinal tumour segmentation via Raidionics' pretrained CT_Tumor model.
 
-Uses a MONAI-based 3-D segmentation model (UNet / AttentionUNet / SwinUNETR)
-trained with the segmentation-torch framework.  Returns a binary mask in the
-same RAS / 1×1×2 mm space used by the SCLC preprocessor so the MIL bag
-builder can select tumour-positive axial slices.
+Runs raidionics_rads_lib's "Model selection" -> CT_Tumor pipeline (which
+internally also runs CT_Lungs as a required preprocessing/cropping step) on
+the uploaded CT, then resamples the resulting tumour mask into the same
+RAS / 1x1x2mm grid the SCLC preprocessor uses, so it can bias MIL slice
+selection and back the segmentation-ROI NIfTI overlay.
 
-Configuration (env vars / .env):
-  SEGMENTATION_MODEL_PATH         Path to a PyTorch or Lightning checkpoint.
-  SEGMENTATION_MODEL_CONFIG_JSON  JSON with model + preprocessing params.
-  SEGMENTATION_DEVICE             "cpu" | "cuda" | "cuda:0" etc.
+Model bundles are downloaded once (lazily) from the public Raidionics-models
+GitHub releases into MODEL_CACHE_DIR/raidionics/{CT_Lungs,CT_Tumor}/hr/.
 
-Model config JSON fields:
-  model_type            "AttentionUNet" | "UNet" | "SwinUNETR"
-  nb_classes            int (default 2)
-  network_shape         [H, W, D, C]  — spatial dims + input channels
-  features              list[int]  — UNet/AttentionUNet channel sizes
-  normalization_layer   "instance" | "batch" | "layer"
-  dropout_rate          float
-  roi_size              list[int]  — sliding-window patch (default [128,128,128])
-  sw_overlap            float (default 0.5)
-  output_spacing        list[float]  — mm, default [1.0, 1.0, 2.0]
-  intensity_normalization  "znormalization" | "scaleintensity" | null
-
-Falls back to None (no segmentation) when unconfigured or on any error.
+raidionicsrads.compute.run_rads() never raises and uses a process-wide
+config singleton, so a lock serializes calls and output-file existence is
+the correctness signal (matching this class's existing fail-soft contract:
+falls back to None on any error so classification never breaks).
 """
 from __future__ import annotations
 
 import json
 import os
 import tempfile
+import threading
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -36,142 +29,189 @@ import numpy as np
 
 from app.config import get_settings
 
+_MODEL_URLS = {
+    "CT_Lungs": "https://github.com/raidionics/Raidionics-models/releases/download/v1.3.0-rc/Raidionics-CT_Lungs-v13.zip",
+    "CT_Tumor": "https://github.com/raidionics/Raidionics-models/releases/download/v1.3.0-rc/Raidionics-CT_Tumor-v13.zip",
+}
+
+_PIPELINE_JSON = {
+    "1": {
+        "task": "Model selection",
+        "model": "CT_Tumor",
+        "timestamp": 0,
+        "format": "thresholding",
+        "description": "Tumor segmentation model selection",
+    }
+}
+
+_GZIP_MAGIC = b"\x1f\x8b"
+_run_rads_lock = threading.Lock()
+
 
 class SegmentationRuntime:
     def __init__(self) -> None:
         self.settings = get_settings()
-        self._model = None
-        self._cfg: dict[str, Any] = {}
-        self._torch = None
+        self._last_affine: Any = None
+        self._last_ct_volume: Any = None
+        self._models_ready: bool | None = None
 
-    def _is_configured(self) -> bool:
-        p = self.settings.segmentation_model_path
-        return bool(p and Path(p).exists())
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def _ensure_loaded(self) -> bool:
-        if self._model is not None:
-            return True
-        if not self._is_configured():
-            return False
-        try:
-            import torch  # noqa: F401
-        except ImportError:
-            return False
-        import torch
-        try:
-            self._cfg = json.loads(self.settings.segmentation_model_config_json or "{}")
-        except json.JSONDecodeError:
-            return False
-        try:
-            self._model = self._build_model()
-            self._load_checkpoint(self._model)
-            self._model.to(torch.device(self.settings.segmentation_device))
-            self._model.eval()
-            self._torch = torch
-        except Exception:
-            self._model = None
-            return False
-        return True
+    def get_last_affine(self) -> np.ndarray | None:
+        return self._last_affine
 
-    def _build_model(self):
-        model_type = self._cfg.get("model_type", "AttentionUNet")
-        nb_classes = int(self._cfg.get("nb_classes", 2))
-        shape = self._cfg.get("network_shape", [128, 128, 128, 1])
-        features = self._cfg.get("features", [16, 32, 64, 128, 256])
-        norm = self._cfg.get("normalization_layer", "instance")
-        dropout = float(self._cfg.get("dropout_rate", 0.0))
-        spatial_dims = len(shape) - 1
-        in_ch = shape[-1]
-
-        if model_type == "AttentionUNet":
-            from monai.networks.nets import AttentionUnet
-            return AttentionUnet(
-                spatial_dims=spatial_dims, in_channels=in_ch, out_channels=nb_classes,
-                channels=features, strides=[2] * (len(features) - 1), dropout=dropout,
-            )
-        if model_type == "UNet":
-            from monai.networks.nets import UNet
-            return UNet(
-                spatial_dims=spatial_dims, in_channels=in_ch, out_channels=nb_classes,
-                channels=features, strides=[2] * (len(features) - 1),
-                num_res_units=2, norm=norm, dropout=dropout,
-            )
-        if model_type == "SwinUNETR":
-            from monai.networks.nets import SwinUNETR
-            return SwinUNETR(
-                img_size=shape[:-1], in_channels=in_ch, out_channels=nb_classes,
-                feature_size=features[0] if features else 48,
-                norm_name=norm, spatial_dims=spatial_dims,
-            )
-        raise ValueError(f"Unknown segmentation model_type: {model_type!r}")
-
-    def _load_checkpoint(self, model) -> None:
-        import torch
-        ckpt = torch.load(
-            str(self.settings.segmentation_model_path), map_location="cpu", weights_only=False
-        )
-        sd = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
-        for prefix in ("model.", "net.", ""):
-            stripped = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
-            res = model.load_state_dict(stripped, strict=False)
-            if len(res.missing_keys) < len(model.state_dict()) // 2:
-                return
-        model.load_state_dict(sd, strict=False)
+    def get_last_ct_volume(self) -> np.ndarray | None:
+        return self._last_ct_volume
 
     def segment(self, file_bytes: bytes) -> np.ndarray | None:
-        """Return binary 3-D mask (H×W×Z) in RAS / 1×1×2 mm space, or None."""
-        if not self._ensure_loaded():
+        """Return binary 3-D tumour mask (H×W×Z) in RAS / 1×1×2mm space, or None."""
+        try:
+            ct_volume, ct_affine = self._resample_ct_background(file_bytes)
+            self._last_ct_volume = ct_volume
+            self._last_affine = ct_affine
+        except Exception:
             return None
-        _GZIP = b"\x1f\x8b"
-        suffix = ".nii.gz" if file_bytes[:2] == _GZIP else ".nii"
+
+        model_folder = Path(self.settings.model_cache_dir) / "raidionics"
+        if not self._ensure_models_downloaded(model_folder):
+            return None
+
+        try:
+            mask_path = self._run_raidionics(file_bytes, model_folder)
+            if mask_path is None:
+                return None
+            return self._resample_mask_to_ct_grid(mask_path, ct_volume.shape, ct_affine)
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # Model download
+    # ------------------------------------------------------------------
+
+    def _ensure_models_downloaded(self, model_folder: Path) -> bool:
+        if self._models_ready:
+            return True
+        try:
+            for name, url in _MODEL_URLS.items():
+                if (model_folder / name / "hr" / "pipeline.json").exists():
+                    continue
+                model_folder.mkdir(parents=True, exist_ok=True)
+                zip_path = model_folder / f"{name}.zip"
+                urllib.request.urlretrieve(url, zip_path)
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(model_folder)
+                zip_path.unlink(missing_ok=True)
+            self._models_ready = True
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # CT background (independent of raidionics; needed for overlay compositing
+    # and because this runs before ModelRuntime's own resampled CT is ready)
+    # ------------------------------------------------------------------
+
+    def _resample_ct_background(self, file_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
+        from monai.transforms import Compose, EnsureChannelFirstd, Orientationd, Spacingd
+        from sclc.data.transforms import LoadNiftiWithRGBSupportd
+
+        suffix = ".nii.gz" if file_bytes[:2] == _GZIP_MAGIC else ".nii"
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
         try:
             with os.fdopen(tmp_fd, "wb") as fh:
                 fh.write(file_bytes)
-            return self._run_inference(tmp_path)
-        except Exception:
-            return None
+            load_tfms = Compose([
+                LoadNiftiWithRGBSupportd(keys=["image"]),
+                EnsureChannelFirstd(keys=["image"], channel_dim="no_channel"),
+                Orientationd(keys=["image"], axcodes="RAS"),
+                Spacingd(keys=["image"], pixdim=(1.0, 1.0, 2.0), mode=["bilinear"]),
+            ])
+            raw_img = load_tfms({"image": tmp_path})["image"]
+            affine = np.asarray(raw_img.affine.cpu() if hasattr(raw_img.affine, "cpu") else raw_img.affine)
+            volume = np.clip((raw_img[0].detach().cpu().numpy() + 1024.0) / (3071.0 + 1024.0), 0.0, 1.0)
+            return volume, affine
         finally:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
 
-    def _run_inference(self, tmp_path: str) -> np.ndarray | None:
-        import torch
-        from monai.inferers import SlidingWindowInferer
-        from monai.transforms import (
-            Compose, EnsureChannelFirstd, Orientationd,
-            ScaleIntensityRanged, Spacingd, ToTensord,
-        )
-        from sclc.data.transforms import LoadNiftiWithRGBSupportd
+    # ------------------------------------------------------------------
+    # Raidionics pipeline
+    # ------------------------------------------------------------------
 
-        spacing = self._cfg.get("output_spacing", [1.0, 1.0, 2.0])
-        norm_method = self._cfg.get("intensity_normalization", "znormalization")
-        roi_size = self._cfg.get("roi_size", [128, 128, 128])
-        overlap = float(self._cfg.get("sw_overlap", 0.5))
+    def _run_raidionics(self, file_bytes: bytes, model_folder: Path) -> Path | None:
+        import configparser
 
-        tfms = [
-            LoadNiftiWithRGBSupportd(keys=["image"]),
-            EnsureChannelFirstd(keys=["image"], channel_dim="no_channel"),
-            Orientationd(keys=["image"], axcodes="RAS"),
-            Spacingd(keys=["image"], pixdim=spacing, mode=["bilinear"]),
-        ]
-        if norm_method == "znormalization":
-            from monai.transforms import NormalizeIntensityd
-            tfms.append(NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True))
-        elif norm_method == "scaleintensity":
-            tfms.append(ScaleIntensityRanged(
-                keys=["image"], a_min=-1024, a_max=3071, b_min=0, b_max=1, clip=True
-            ))
-        tfms.append(ToTensord(keys=["image"]))
+        from raidionicsrads.compute import run_rads
 
-        img = Compose(tfms)({"image": tmp_path})["image"].unsqueeze(0)
-        device = torch.device(self.settings.segmentation_device)
-        img = img.to(device)
+        suffix = ".nii.gz" if file_bytes[:2] == _GZIP_MAGIC else ".nii"
+        with tempfile.TemporaryDirectory() as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+            input_dir = tmp_dir / "input" / "0"
+            input_dir.mkdir(parents=True)
+            output_dir = tmp_dir / "output"
+            output_dir.mkdir()
+            (input_dir / f"study{suffix}").write_bytes(file_bytes)
 
-        inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=1, overlap=overlap, mode="gaussian")
-        with torch.no_grad():
-            logits = inferer(img, self._model)
+            pipeline_path = tmp_dir / "pipeline.json"
+            pipeline_path.write_text(json.dumps(_PIPELINE_JSON), encoding="utf-8")
 
-        return logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+            # gpu_id=-1 combined with acceleration=torch crashes inside
+            # raidionicsseg (tries an invalid "cuda:-1" torch device even
+            # with no GPU requested) — gpu_id=0/acceleration=torch is the
+            # only combination verified to work on this hardware; the ONNX
+            # model itself still falls back to its CPU execution provider
+            # if no CUDA-enabled onnxruntime build is installed.
+            has_cuda = "cuda" in self.settings.segmentation_device.lower()
+            gpu_id, acceleration = ("0", "torch") if has_cuda else ("-1", "cpu")
+
+            config = configparser.ConfigParser()
+            config["Default"] = {"task": "mediastinum_diagnosis", "trace": "False", "caller": ""}
+            config["System"] = {
+                "gpu_id": gpu_id,
+                "acceleration": acceleration,
+                "input_folder": str(tmp_dir / "input"),
+                "output_folder": str(output_dir),
+                "model_folder": str(model_folder),
+                "pipeline_filename": str(pipeline_path),
+            }
+            config["Runtime"] = {
+                "reconstruction_method": "thresholding",
+                "reconstruction_order": "resample_first",
+                "use_stripped_data": "False",
+                "use_registered_data": "False",
+            }
+            config_path = tmp_dir / "config.ini"
+            with config_path.open("w", encoding="utf-8") as fh:
+                config.write(fh)
+
+            with _run_rads_lock:
+                run_rads(str(config_path))
+
+            matches = list(output_dir.rglob("*_annotation-Tumor.nii.gz"))
+            if not matches:
+                return None
+
+            # Copy out of the temp dir before it's cleaned up by the context manager.
+            persisted = Path(tempfile.mkstemp(suffix=".nii.gz")[1])
+            persisted.write_bytes(matches[0].read_bytes())
+            return persisted
+
+    def _resample_mask_to_ct_grid(
+        self, mask_path: Path, target_shape: tuple[int, ...], target_affine: np.ndarray
+    ) -> np.ndarray:
+        import nibabel as nib
+        from nibabel.processing import resample_from_to
+
+        try:
+            mask_img = nib.load(str(mask_path))
+            resampled = resample_from_to(mask_img, (target_shape, target_affine), order=0)
+            return (resampled.get_fdata() > 0.5).astype(np.uint8)
+        finally:
+            try:
+                mask_path.unlink()
+            except OSError:
+                pass

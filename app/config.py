@@ -34,7 +34,12 @@ class Settings(BaseSettings):
     model_factory_kwargs_json: str = "{}"
 
     # Segmentation model (optional — used for tumor-positive MIL slice selection)
+    # Set segmentation_model_path to use a local file directly; otherwise the
+    # checkpoint is downloaded from blob storage using the shared azure_* settings.
     segmentation_model_path: str | None = None
+    segmentation_model_name: str = "segmentation"
+    segmentation_model_version: str = "v1"
+    segmentation_model_file: str = "checkpoint.pth"
     segmentation_model_config_json: str = "{}"
     segmentation_device: str = "cpu"
 

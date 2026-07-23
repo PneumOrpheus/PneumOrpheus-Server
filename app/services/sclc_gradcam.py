@@ -1,14 +1,21 @@
-"""GradCAM++ for SCLC MIL FPN models.
+"""GradCAM++ for SCLC MIL models.
 
-Supports two backbone families:
-  • ResNet-50 FPN  (MILResNet50Classifier)   → hooks model.resnet.layer4
-  • Swin-based FPN (MILSwinV2TinyClassifier,  → hooks model.fpn
-                    MILSwinV2BaseClassifier,
-                    MILSwinTinyClassifier)
+Supports three backbone families:
+  • ResNet-50 FPN     (MILResNet50Classifier)  → hooks model.resnet.layer4
+  • Swin-based FPN     (MILSwinV2TinyClassifier, → hooks model.fpn
+                        MILSwinV2BaseClassifier,
+                        MILSwinTinyClassifier)
+  • Base (non-FPN) MIL (any MONAI MILModel wrapping a timm Swin backbone,
+                        e.g. mil_swinv2_tiny with use_advanced_fpn=False)
+                        → hooks model.mil.net.layers[-1]
 
-For the Swin family, layer4 does not exist.  The FPN fused output
+For the Swin FPN family, layer4 does not exist; the FPN fused output
 (B*N, fpn_channels, h, w) is the deepest spatial feature map before the
 global-average-pool in the instance head, so it is the natural CAM target.
+For the base (non-FPN) MIL path, MONAI's MILModel stores the backbone as
+self.mil.net; timm's SwinTransformerV2 exposes its last stage's spatial
+feature map as model.mil.net.layers[-1], in NHWC format (unlike the FPN
+branch's NCHW), so it needs a permute before the NCHW GradCAM math below.
 
 Returns (cam_np (N,H,W), att_np (N,)) in all cases.
 Falls back to zeros / uniform weights on any error so inference never fails.
@@ -19,12 +26,17 @@ import numpy as np
 
 
 def _pick_hook_target(model):
-    """Return the module to hook, and whether its output is a tuple."""
+    """Return (module_to_hook, output_is_tuple, needs_nhwc_permute)."""
     if hasattr(model, "resnet") and hasattr(model.resnet, "layer4"):
-        return model.resnet.layer4, False
+        return model.resnet.layer4, False, False
     if hasattr(model, "fpn"):
-        return model.fpn, True
-    return None, False
+        return model.fpn, True, False
+    mil = getattr(model, "mil", None)
+    net = getattr(mil, "net", None)
+    layers = getattr(net, "layers", None)
+    if layers is not None and len(layers) > 0:
+        return layers[-1], False, True
+    return None, False, False
 
 
 def compute_gradcam_pp(
@@ -53,7 +65,7 @@ def compute_gradcam_pp(
         )
 
     try:
-        target_module, output_is_tuple = _pick_hook_target(model)
+        target_module, output_is_tuple, needs_nhwc_permute = _pick_hook_target(model)
         if target_module is None:
             return _fallback(input_tensor)
 
@@ -64,11 +76,17 @@ def compute_gradcam_pp(
 
         def _fwd(module, inp, out):
             # For FPN the output is (fused, aux) and we only need fused
-            activations.append(out[0] if output_is_tuple else out)
+            act = out[0] if output_is_tuple else out
+            if needs_nhwc_permute:
+                act = act.permute(0, 3, 1, 2)
+            activations.append(act)
 
         def _bwd(module, grad_in, grad_out):
             # grad_out[0] is the gradient w.r.t. the first (fused) output
-            gradients.append(grad_out[0])
+            grad = grad_out[0]
+            if needs_nhwc_permute:
+                grad = grad.permute(0, 3, 1, 2)
+            gradients.append(grad)
 
         fwd_h = target_module.register_forward_hook(_fwd)
         bwd_h = target_module.register_full_backward_hook(_bwd)
