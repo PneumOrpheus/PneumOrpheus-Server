@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: sclc
+Version: 0.1.0
+Summary: Lung cancer subtype classification pipeline, with focus on SCLC (master's thesis, NTNU 2026).
+Author: Hans Stemshaug, Rafael Henrik Valdes Oversand
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown

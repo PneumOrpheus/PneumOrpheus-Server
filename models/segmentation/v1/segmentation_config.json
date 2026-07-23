@@ -7,6 +7,6 @@
   "dropout_rate": 0.0,
   "roi_size": [128, 128, 128],
   "sw_overlap": 0.5,
-  "output_spacing": [1.0, 1.0, 2.0],
+  "output_spacing": [1.0, 1.0, 1.0],
   "intensity_normalization": "znormalization"
 }

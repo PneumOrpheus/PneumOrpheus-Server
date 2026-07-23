@@ -1,0 +1,17 @@
+pyproject.toml
+sclc/__init__.py
+sclc.egg-info/PKG-INFO
+sclc.egg-info/SOURCES.txt
+sclc.egg-info/dependency_links.txt
+sclc.egg-info/top_level.txt
+sclc/data/__init__.py
+sclc/data/transforms.py
+sclc/grad_cam/__init__.py
+sclc/grad_cam/colorize.py
+sclc/models/__init__.py
+sclc/models/advanced_fpn.py
+sclc/models/classifiers_2d.py
+sclc/models/classifiers_mil.py
+sclc/models/classifiers_rin.py
+sclc/models/factory.py
+sclc/models/swin_unetr.py
