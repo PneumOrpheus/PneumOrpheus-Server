@@ -332,3 +332,76 @@ def _render_gradcam_slice(ct_slice: np.ndarray, cam_slice: np.ndarray | None) ->
     image.save(buffer, format="JPEG", quality=84)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/jpeg;base64,{encoded}", cam_coverage
+
+
+def build_nifti_file_payload(
+    array: np.ndarray, affine: np.ndarray, filename: str, dtype: Any = np.float32
+) -> dict[str, Any]:
+    """Serialize a (H,W,Z) numpy volume + affine into a downloadable NIfTI blob."""
+    with NamedTemporaryFile(suffix=".nii.gz") as tmp:
+        nib.save(nib.Nifti1Image(array.astype(dtype), affine), tmp.name)
+        tmp.seek(0)
+        raw = tmp.read()
+    return {
+        "filename": filename,
+        "mimeType": "application/gzip",
+        "sizeBytes": len(raw),
+        "base64Data": base64.b64encode(raw).decode("ascii"),
+    }
+
+
+_RGB_DTYPE = np.dtype([("R", "u1"), ("G", "u1"), ("B", "u1")])
+
+
+def build_rgb_nifti_file_payload(rgb: np.ndarray, affine: np.ndarray, filename: str) -> dict[str, Any]:
+    """Serialize a (H,W,Z,3) uint8 volume + affine into an RGB24 NIfTI blob."""
+    packed = np.ascontiguousarray(rgb).view(dtype=_RGB_DTYPE).reshape(rgb.shape[:3])
+    img = nib.Nifti1Image(packed, affine)
+    img.header.set_data_dtype(_RGB_DTYPE)
+    with NamedTemporaryFile(suffix=".nii.gz") as tmp:
+        nib.save(img, tmp.name)
+        tmp.seek(0)
+        raw = tmp.read()
+    return {
+        "filename": filename,
+        "mimeType": "application/gzip",
+        "sizeBytes": len(raw),
+        "base64Data": base64.b64encode(raw).decode("ascii"),
+    }
+
+
+def build_segmentation_overlay_volume(
+    ct_volume: np.ndarray, mask_volume: np.ndarray, color: tuple[int, int, int] = (244, 63, 94), alpha: float = 0.55
+) -> np.ndarray:
+    """CT grayscale with a flat-colored overlay baked in where mask > 0. Returns (H,W,Z,3) uint8."""
+    ct = np.clip(ct_volume.astype(np.float32), 0.0, 1.0)
+    base = np.stack([ct, ct, ct], axis=-1)
+    heat = np.array(color, dtype=np.float32) / 255.0
+    w = (alpha * (mask_volume > 0)).astype(np.float32)[..., None]
+    out = (1.0 - w) * base + w * heat
+    return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def build_gradcam_overlay_volume(
+    ct_volume: np.ndarray, cam_np: np.ndarray, mil_indices: np.ndarray
+) -> np.ndarray:
+    """CT grayscale with a jet-colored Grad-CAM overlay baked in on the sampled MIL
+    slices; other slices fall back to plain CT (colorize_overlay with cam=0 is a
+    no-op blend). Returns (H,W,Z,3) uint8.
+    """
+    import torch
+    import torch.nn.functional as F
+    from sclc.grad_cam.colorize import colorize_overlay
+
+    H, W, Z = ct_volume.shape
+    cam_full = np.zeros((H, W, Z), dtype=np.float32)
+    cam_t = torch.from_numpy(cam_np).float().unsqueeze(1)  # (N, 1, h, w)
+    resized = F.interpolate(cam_t, size=(H, W), mode="bilinear", align_corners=False).squeeze(1).numpy()
+    for i, z in enumerate(mil_indices.tolist()):
+        cam_full[:, :, int(z)] = resized[i]
+
+    out = np.empty((H, W, Z, 3), dtype=np.uint8)
+    ct = np.clip(ct_volume.astype(np.float32), 0.0, 1.0)
+    for z in range(Z):
+        out[:, :, z, :] = colorize_overlay(ct[:, :, z], cam_full[:, :, z])
+    return out

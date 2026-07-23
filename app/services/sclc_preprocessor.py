@@ -28,12 +28,15 @@ def preprocess_for_inference(
     modality: str,
     metadata: dict[str, Any],
     tumor_mask: np.ndarray | None = None,
-) -> "torch.Tensor":
+) -> tuple["torch.Tensor", dict[str, Any]]:
     """Entry point called by ModelRuntime._make_input_tensor.
 
     tumor_mask : optional binary 3-D numpy array (HxWxZ) in RAS / 1x1x2 mm
                  space.  When provided, MIL bag slices are selected from
                  tumour-positive axial positions instead of evenly spaced.
+
+    Returns (tensor, extras); extras has ct_volume/ct_affine/mil_indices for
+    the "mil" pipeline, else {}.
     """
     pipeline = str(metadata.get("pipeline", "mil")).lower()
     img_size = int(metadata.get("img_size", 256))
@@ -48,8 +51,8 @@ def preprocess_for_inference(
                 tmp_path, img_size, int(metadata.get("bag_size", 16)), tumor_mask
             )
         if pipeline == "2d":
-            return _preprocess_2d(tmp_path, img_size)
-        return _preprocess_3d(tmp_path, img_size, int(metadata.get("depth_size", 64)))
+            return _preprocess_2d(tmp_path, img_size), {}
+        return _preprocess_3d(tmp_path, img_size, int(metadata.get("depth_size", 64))), {}
     finally:
         try:
             os.unlink(tmp_path)
@@ -125,16 +128,19 @@ def _preprocess_mil(
     img_size: int,
     bag_size: int,
     tumor_mask: np.ndarray | None = None,
-) -> "torch.Tensor":
+) -> tuple["torch.Tensor", dict[str, Any]]:
     """MIL bag: tumour-positive (or evenly-spaced) axial slices.
 
-    Returns (1, bag_size, 1, img_size, img_size).
+    Returns ((1, bag_size, 1, img_size, img_size), extras).
     """
     import torch
     from monai.transforms import NormalizeIntensity, Resize
 
-    img = _load_volume(tmp_path, img_size)
-    img = Resize(spatial_size=(img_size, img_size, -1), mode="trilinear")(img)  # (1, H, W, Z)
+    full_res = _load_volume(tmp_path, img_size)  # (1, H, W, Z), native res, .affine attached
+    ct_affine = np.asarray(full_res.affine.cpu() if hasattr(full_res.affine, "cpu") else full_res.affine)
+    ct_volume = full_res[0].detach().cpu().numpy()  # (H, W, Z)
+
+    img = Resize(spatial_size=(img_size, img_size, -1), mode="trilinear")(full_res)  # (1, H, W, Z)
 
     Z = img.shape[-1]
     idxs = _select_mil_indices(Z, bag_size, tumor_mask)
@@ -145,7 +151,12 @@ def _preprocess_mil(
     norm = NormalizeIntensity(nonzero=True, channel_wise=True)
     bag = torch.stack([norm(bag[i]) for i in range(bag.shape[0])], dim=0)
 
-    return bag.unsqueeze(0)  # (1, N, 1, H, W)
+    extras = {
+        "ct_volume": ct_volume,
+        "ct_affine": ct_affine,
+        "mil_indices": idxs.cpu().numpy(),
+    }
+    return bag.unsqueeze(0), extras  # (1, N, 1, H, W)
 
 
 def _preprocess_2d(tmp_path: str, img_size: int) -> "torch.Tensor":

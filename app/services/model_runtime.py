@@ -27,6 +27,10 @@ class ModelRuntime:
         self._model = None
         self._metadata: dict[str, Any] = {}
         self._last_input_tensor: Any = None
+        self._is_sclc_factory_model = False
+        self._last_ct_volume: Any = None
+        self._last_ct_affine: Any = None
+        self._last_mil_indices: Any = None
 
     def _import_from_path(self, target: str) -> Any:
         if ":" not in target:
@@ -110,6 +114,7 @@ class ModelRuntime:
             model.to(map_location)
             model.eval()
             self._model = model
+            self._is_sclc_factory_model = True
             return
 
         checkpoint = torch.load(str(model_file), map_location=map_location, weights_only=False)
@@ -139,7 +144,7 @@ class ModelRuntime:
             )
 
         shape = parse_model_input_shape(self.settings)
-        return torch.zeros(shape)
+        return torch.zeros(shape), {}
 
     def _extract_prediction(self, output: Any) -> tuple[int, float]:
         """Legacy single-output extraction for non-SCLC models."""
@@ -240,9 +245,12 @@ class ModelRuntime:
         torch = self._torch
         model = self._model
         assert torch is not None and model is not None
-        input_tensor = self._make_input_tensor(
+        input_tensor, extras = self._make_input_tensor(
             file_bytes=file_bytes, modality=modality, tumor_mask=tumor_mask
         )
+        self._last_ct_volume = extras.get("ct_volume")
+        self._last_ct_affine = extras.get("ct_affine")
+        self._last_mil_indices = extras.get("mil_indices")
         device = torch.device(self.settings.model_device)
         input_tensor = input_tensor.to(device)
         self._last_input_tensor = input_tensor.detach().cpu()
@@ -253,7 +261,7 @@ class ModelRuntime:
             else:
                 output = model(input_tensor)
         class_labels = parse_class_labels(self.settings)
-        if all_heads:
+        if self._is_sclc_factory_model:
             return self._extract_sclc_outputs(output, class_labels)
         predicted_index, confidence = self._extract_prediction(output)
         predicted_type = (

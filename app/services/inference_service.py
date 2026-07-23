@@ -10,7 +10,14 @@ from app.config import get_settings
 from app.schemas import ClassificationItem, InferenceResponse, SourceFileMetadata
 from app.services.model_runtime import ModelRuntime
 from app.services.model_store import ModelStore
-from app.services.nifti_visualization import build_nifti_visualization, build_three_visualizations
+from app.services.nifti_visualization import (
+    build_gradcam_overlay_volume,
+    build_nifti_file_payload,
+    build_nifti_visualization,
+    build_rgb_nifti_file_payload,
+    build_segmentation_overlay_volume,
+    build_three_visualizations,
+)
 from app.services.segmentation_runtime import SegmentationRuntime
 from app.services.tnm_staging import derive_tnm
 
@@ -121,6 +128,10 @@ class InferenceService:
             segmentation_data["plainCt"] = three_vis["plainCt"]
             segmentation_data["segmentationOverlay"] = three_vis["segmentationOverlay"]
             segmentation_data["gradCamOverlay"] = three_vis["gradCamOverlay"]
+            # pneumorpheus-app only recognises a single `segmentationData.visualization`
+            # block (legacy shape); alias the segmentation-overlay variant into it so
+            # the app's slice viewer actually has something to render.
+            segmentation_data["visualization"] = _to_app_visualization(three_vis["segmentationOverlay"])
         else:
             # Fallback: single NIfTI visualization for non-MIL inputs
             visualization = build_nifti_visualization(
@@ -130,6 +141,18 @@ class InferenceService:
             )
             if visualization:
                 segmentation_data["visualization"] = visualization
+
+        nifti_files = _build_nifti_files(
+            ct_volume=runtime._last_ct_volume,
+            ct_affine=runtime._last_ct_affine,
+            mil_indices=runtime._last_mil_indices,
+            tumor_mask=tumor_mask,
+            seg_ct_volume=self.segmentation_runtime.get_last_ct_volume(),
+            seg_affine=self.segmentation_runtime.get_last_affine(),
+            gradcam_data=gradcam_data,
+        )
+        if nifti_files:
+            segmentation_data["niftiFiles"] = nifti_files
 
         findings = _build_findings(predicted_type, confidence, all_class_probs, bbox, tnm)
         left_cls, right_cls = _build_classifications(predicted_type, confidence, all_class_probs, bbox)
@@ -165,6 +188,61 @@ class InferenceService:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _build_nifti_files(
+    ct_volume: np.ndarray | None,
+    ct_affine: np.ndarray | None,
+    mil_indices: np.ndarray | None,
+    tumor_mask: np.ndarray | None,
+    seg_ct_volume: np.ndarray | None,
+    seg_affine: np.ndarray | None,
+    gradcam_data: tuple[np.ndarray, np.ndarray] | None,
+) -> dict[str, Any]:
+    files: dict[str, Any] = {}
+
+    if ct_volume is not None and ct_affine is not None:
+        files["plainCt"] = build_nifti_file_payload(ct_volume, ct_affine, "plain_ct.nii.gz")
+
+    if tumor_mask is not None and seg_affine is not None and seg_ct_volume is not None:
+        try:
+            rgb = build_segmentation_overlay_volume(seg_ct_volume, tumor_mask)
+            files["segmentationRoi"] = build_rgb_nifti_file_payload(rgb, seg_affine, "segmentation_roi.nii.gz")
+        except Exception:
+            pass
+
+    if (
+        gradcam_data is not None
+        and ct_volume is not None
+        and ct_affine is not None
+        and mil_indices is not None
+    ):
+        try:
+            cam_np, _att_np = gradcam_data
+            rgb = build_gradcam_overlay_volume(ct_volume, cam_np, mil_indices)
+            files["gradCam"] = build_rgb_nifti_file_payload(rgb, ct_affine, "grad_cam.nii.gz")
+        except Exception:
+            pass
+
+    return files
+
+
+def _to_app_visualization(vis: dict[str, Any]) -> dict[str, Any]:
+    """Remap a slice-overlay-v1 block's per-slice keys to what pneumorpheus-app's
+    AnalysisVisualization component reads (hasOverlay/overlayCoverage instead of
+    this server's own hasMask/maskCoverage naming).
+    """
+    return {
+        **vis,
+        "slices": [
+            {
+                **slice_item,
+                "hasOverlay": slice_item.get("hasMask", False),
+                "overlayCoverage": slice_item.get("maskCoverage", 0.0),
+            }
+            for slice_item in vis.get("slices", [])
+        ],
+    }
+
 
 def _bbox_x_center(bbox: np.ndarray | None) -> float | None:
     """Return normalised x-centre of the bounding box, or None."""
