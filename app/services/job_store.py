@@ -16,7 +16,7 @@ from typing import Any, Literal
 JobStatus = Literal["processing", "completed", "failed"]
 
 _PROCESSING_TTL_SECONDS = 3600
-_TERMINAL_TTL_SECONDS = 600
+_TERMINAL_TTL_SECONDS = 120
 _lock = threading.Lock()
 _jobs: dict[str, dict[str, Any]] = {}
 
