@@ -28,7 +28,7 @@ variables:
   modelLocalDir: "/models"
   azureStorageAccountUrl: "https://pneumorphstore.blob.core.windows.net"
   azureBlobContainer: "models"
-  azureBlobPrefix: "models"
+  azureBlobPrefix: ""
 
   segmentationModelName: "segmentation"
   segmentationModelVersion: "v1"

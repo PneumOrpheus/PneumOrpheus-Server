@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     azure_storage_account_url: str | None = None
     azure_blob_container: str | None = None
-    azure_blob_prefix: str = "models"
+    azure_blob_prefix: str = ""
 
     model_cache_dir: str = "./model-cache"
     model_device: str = "cpu"
