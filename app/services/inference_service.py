@@ -67,13 +67,11 @@ class InferenceService:
         seg_per_instance: np.ndarray | None = runtime_result.get("seg_per_instance")
         bbox: np.ndarray | None = runtime_result.get("bbox")
 
-        # TNM staging (IASLC 9th edition, 2025)
+        # TNM staging (IASLC 9th edition, 2025), sized off the real tumour segmentation mask.
         tnm = derive_tnm(
             predicted_type=predicted_type,
             confidence=confidence,
-            seg_per_instance=seg_per_instance,
-            seg_mask=seg_mask,
-            bbox=bbox,
+            tumor_mask_3d=tumor_mask,
         )
         proposed_tnm = tnm["tnm_string"]
 
@@ -154,7 +152,7 @@ class InferenceService:
         if nifti_files:
             segmentation_data["niftiFiles"] = nifti_files
 
-        findings = _build_findings(predicted_type, confidence, all_class_probs, bbox, tnm)
+        findings = _build_findings(predicted_type, confidence, bbox, tnm)
         left_cls, right_cls = _build_classifications(predicted_type, confidence, all_class_probs, bbox)
 
         return InferenceResponse(
@@ -254,21 +252,11 @@ def _bbox_x_center(bbox: np.ndarray | None) -> float | None:
 def _build_findings(
     predicted_type: str,
     confidence: float,
-    all_class_probs: dict[str, float],
     bbox: np.ndarray | None,
     tnm: dict,
 ) -> str:
     pct = round(confidence * 100)
     text = f"Model predicts {predicted_type} with {pct}% confidence"
-
-    if all_class_probs:
-        others = sorted(
-            ((k, round(v * 100)) for k, v in all_class_probs.items() if k != predicted_type),
-            key=lambda kv: -kv[1],
-        )
-        if others:
-            diff = "; ".join(f"{k}: {v}%" for k, v in others[:2])
-            text += f" (differential: {diff})"
 
     x_center = _bbox_x_center(bbox)
     if x_center is not None:
@@ -279,17 +267,14 @@ def _build_findings(
     t_cat = tnm.get("t", "Tx")
     tnm_str = tnm.get("tnm_string", "")
     if diam is not None:
-        text += f". Estimated solid-component diameter ~{diam} mm ({t_cat})"
+        text += f". Estimated tumour diameter ~{diam} mm ({t_cat})"
     if tnm_str:
+        text += f". Staging: {tnm_str}"
         best = tnm.get("best_case_stage", "")
-        text += f". Provisional staging: {tnm_str}"
         if best:
-            text += f"; best-case {best}"
+            text += f" ({best})"
 
-    text += (
-        ". N and M could not be determined from imaging alone — nodal and distant metastasis "
-        "workup required. Analysis based on CT morphology, density patterns, and multi-instance attention."
-    )
+    text += ". Analysis based on CT morphology, density patterns, and multi-instance attention."
     return text
 
 
